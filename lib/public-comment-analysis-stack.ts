@@ -122,6 +122,13 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       description: 'Processes a range of comments',
     });
 
+    const batchChecker = new lambda.Function(this, 'BatchCheckerFunction', {
+      ...lambdaConfig,
+      code: lambda.Code.fromAsset('lambda/batch-checker'),
+      handler: 'index.lambda_handler',
+      description: 'Checks if there are more batches to process',
+    });
+
     const combiner = new lambda.Function(this, 'CombinerFunction', {
       ...lambdaConfig,
       code: lambda.Code.fromAsset('lambda/combiner'),
@@ -140,6 +147,12 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       lambdaFunction: workRangeCalculator,
       inputPath: '$.initResult.Payload',
       resultPath: '$.workBatches',
+      retryOnServiceExceptions: true,
+    });
+
+    const checkBatchProgressStep = new tasks.LambdaInvoke(this, 'CheckBatchProgress', {
+      lambdaFunction: batchChecker,
+      resultPath: '$.batchCheck',
       retryOnServiceExceptions: true,
     });
 
@@ -205,7 +218,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     // Check if more batches to process
     const checkMoreBatchesStep = new sfn.Choice(this, 'MoreBatches')
       .when(
-        sfn.Condition.numberLessThanJsonPath('$.currentBatch', '$.totalBatches'),
+        sfn.Condition.booleanEquals('$.batchCheck.Payload.hasMoreBatches', true),
         calculateWaitTime
           .next(waitForRateLimit)
           .next(incrementBatchStep)
@@ -221,6 +234,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     // Create the sequential batch processing loop
     const batchProcessingLoop = getBatchStep
       .next(processBatchStep)
+      .next(checkBatchProgressStep)
       .next(checkMoreBatchesStep);
 
     // Define the main state machine
