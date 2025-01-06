@@ -73,7 +73,7 @@ def initialize_state(
     document_info: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Initialize processing state in DynamoDB."""
-    total_comments = min(document_info['totalComments'], 400)
+    total_comments = min(document_info['totalComments'], 450)
     state = {
         'documentId': document_id,
         'objectId': document_info['objectId'],
@@ -116,7 +116,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         # Get document information and comment count
         document_info = api_client.get_document_info(document_id)
-        total_comments = min(document_info['totalComments'], 400)
+        total_comments = min(document_info['totalComments'], 450)
         print(f"Found {total_comments} comments for document")
         
         # Initialize state in DynamoDB

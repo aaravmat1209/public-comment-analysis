@@ -5,13 +5,59 @@ import urllib3
 import csv
 import time
 from io import StringIO
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 
 class RateLimitReached(Exception):
     """Custom exception for rate limit detection"""
     pass
+
+@dataclass
+class AttachmentMetadata:
+    """Represents attachment metadata from regulations.gov API"""
+    comment_id: str  # Parent comment ID
+    document_id: str  # Parent document ID
+    attachment_id: str
+    doc_order: int
+    title: str
+    modify_date: str
+    file_format: str
+    file_url: str
+    size: int
+
+    @classmethod
+    def from_api_response(
+        cls, 
+        attachment_data: Dict[str, Any], 
+        comment_id: str,
+        document_id: str
+    ) -> Optional['AttachmentMetadata']:
+        """Create AttachmentMetadata from API response"""
+        try:
+            attrs = attachment_data['attributes']
+            file_formats = attrs.get('fileFormats', [])
+            
+            if not file_formats:
+                return None
+                
+            # Get the first available file format
+            file_format = file_formats[0]
+            
+            return cls(
+                comment_id=comment_id,
+                document_id=document_id,
+                attachment_id=attachment_data['id'],
+                doc_order=attrs.get('docOrder', 0),
+                title=attrs.get('title', ''),
+                modify_date=attrs.get('modifyDate', ''),
+                file_format=file_format.get('format', ''),
+                file_url=file_format.get('fileUrl', ''),
+                size=file_format.get('size', 0)
+            )
+        except (KeyError, IndexError) as e:
+            print(f"Error parsing attachment data: {str(e)}")
+            return None
 
 @dataclass
 class Comment:
@@ -111,7 +157,10 @@ class RegulationsAPIClient:
         for comment in data:
             try:
                 # Fetch detailed comment to get the comment text
-                detailed_comment = self._make_request(f'/comments/{comment["id"]}', {})['data']
+                detailed_comment = self._make_request(
+                    f'/comments/{comment["id"]}',
+                    {'include': 'attachments'}
+                )
                 detailed_comments.append(detailed_comment)
             except RateLimitReached:
                 # Stop processing more comments but return what we have so far
@@ -123,51 +172,91 @@ class RegulationsAPIClient:
         
         return detailed_comments
 
-def save_comments_chunk(
+def save_comments_and_attachments(
     s3_client,
     bucket: str,
     document_id: str,
     worker_id: int,
     page: int,
-    comments: List[Comment],
+    comments_data: List[Dict[str, Any]],
     rate_limited: bool = False
 ) -> Tuple[str, Dict[str, Any]]:
     """Save a page of comments to S3 with metadata."""
-    if not comments:
-        return None, None
-
-    # Create CSV in memory
-    csv_buffer = StringIO()
-    writer = csv.DictWriter(csv_buffer, fieldnames=comments[0].to_csv_row().keys())
-    writer.writeheader()
-    for comment in comments:
-        writer.writerow(comment.to_csv_row())
+    if not comments_data:
+        return None, None, None
+    
+    # Process comments
+    comments = []
+    attachments = []
+    
+    for comment_response in comments_data:
+        comment_data = comment_response['data']
+        comment = Comment.from_api_response(comment_data)
+        comments.append(comment)
+        
+        # Process attachments if present in the included data
+        if 'included' in comment_response:
+            for attachment_data in comment_response['included']:
+                if attachment_data['type'] == 'attachments':
+                    attachment = AttachmentMetadata.from_api_response(
+                        attachment_data,
+                        comment.comment_id,
+                        document_id
+                    )
+                    if attachment:
+                        attachments.append(attachment)
 
     # Generate filenames
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     rate_limit_suffix = "_rate_limited" if rate_limited else ""
-    csv_key = f"comments/{document_id}/worker_{worker_id}/page_{page}_{timestamp}{rate_limit_suffix}.csv"
-    metadata_key = f"comments/{document_id}/worker_{worker_id}/page_{page}_{timestamp}_metadata.json"
-    
-    # Save CSV
+
+    # Create CSV in memory
+    comments_csv = StringIO()
+    if comments:
+        writer = csv.DictWriter(comments_csv, fieldnames=comments[0].to_csv_row().keys())
+        writer.writeheader()
+        for comment in comments:
+            writer.writerow(comment.to_csv_row())
+
+    comments_key = f"{document_id}/comments/worker_{worker_id}_page_{page}_{timestamp}{rate_limit_suffix}.csv"
     s3_client.put_object(
         Bucket=bucket,
-        Key=csv_key,
-        Body=csv_buffer.getvalue().encode('utf-8'),
+        Key=comments_key,
+        Body=comments_csv.getvalue().encode('utf-8'),
         ContentType='text/csv'
     )
+
+    # Save attachments CSV if we found any
+    attachments_key = None
+    if attachments:
+        attachments_csv = StringIO()
+        writer = csv.DictWriter(attachments_csv, fieldnames=asdict(attachments[0]).keys())
+        writer.writeheader()
+        for attachment in attachments:
+            writer.writerow(asdict(attachment))
+
+        attachments_key = f"{document_id}/attachments/worker_{worker_id}_page_{page}_{timestamp}{rate_limit_suffix}.csv"
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=attachments_key,
+            Body=attachments_csv.getvalue().encode('utf-8'),
+            ContentType='text/csv'
+        )
     
     # Create metadata
     metadata = {
         'workerId': worker_id,
         'pageNumber': page,
         'processedComments': len(comments),
+        'processedAttachments': len(attachments),
         'rateLimited': rate_limited,
-        'outputFile': csv_key,
+        'commentsFile': comments_key,
+        'attachmentsFile': attachments_key,
         'completionTime': datetime.now(timezone.utc).isoformat()
     }
     
     # Save metadata
+    metadata_key = f"{document_id}/metadata/worker_{worker_id}_page_{page}_{timestamp}.json"
     s3_client.put_object(
         Bucket=bucket,
         Key=metadata_key,
@@ -175,7 +264,7 @@ def save_comments_chunk(
         ContentType='application/json'
     )
     
-    return csv_key, metadata
+    return comments_key, attachments_key, metadata
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Process a single page of comments with rate limit handling."""
@@ -208,19 +297,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             print(f"Rate limit reached: {str(e)}")
             rate_limited = True
         
-        # Process any comments we got before rate limit
-        comments = [Comment.from_api_response(item) for item in comments_data]
-        print(f"Worker {worker_id} processed {len(comments)} comments from page {page_number}")
-        
         # Save what we have
-        if comments:
-            output_key, metadata = save_comments_chunk(
+        if comments_data:
+            comments_key, attachments_key, metadata = save_comments_and_attachments(
                 s3_client,
                 os.environ['OUTPUT_S3_BUCKET'],
                 document_id,
                 worker_id,
                 page_number,
-                comments,
+                comments_data,
                 rate_limited
             )
             
@@ -228,9 +313,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'workerId': worker_id,
                 'pageNumber': page_number,
                 'documentId': document_id,
-                'processedComments': len(comments),
-                'outputFile': output_key,
-                'metadataFile': metadata,
+                'processedComments': metadata['processedComments'],
+                'processedAttachments': metadata['processedAttachments'],
+                'commentsFile': comments_key,
+                'attachmentsFile': attachments_key,
+                'metadata': metadata,
                 'rateLimited': rate_limited,
                 'isComplete': not rate_limited
             }
@@ -240,6 +327,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'pageNumber': page_number,
                 'documentId': document_id,
                 'processedComments': 0,
+                'processedAttachments': 0,
                 'rateLimited': rate_limited,
                 'isComplete': not rate_limited
             }
