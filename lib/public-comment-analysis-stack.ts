@@ -15,11 +15,13 @@ export interface PublicCommentAnalysisStackProps extends cdk.StackProps {
   maxConcurrentWorkers?: number;
   lambdaMemorySize?: number;
   maxTimeout?: cdk.Duration;
+  clusteringBucketName?: string;  // Optional during first deployment
 }
 
 export class PublicCommentAnalysisStack extends cdk.Stack {
   public readonly stateMachine: sfn.StateMachine;
   public readonly stateTable: dynamodb.Table;
+  public readonly outputBucketName: string;
 
   constructor(scope: Construct, id: string, props: PublicCommentAnalysisStackProps) {
     super(scope, id, props);
@@ -51,6 +53,9 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       versioned: true,
     });
 
+    // Store bucket name as public property
+    this.outputBucketName = commentsBucket.bucketName;
+
     // Create DynamoDB table for processing state
     this.stateTable = new dynamodb.Table(this, 'ProcessingStateTable', {
       partitionKey: { name: 'documentId', type: dynamodb.AttributeType.STRING },
@@ -80,6 +85,16 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     apiKeySecret.grantRead(baseLambdaRole);
     commentsBucket.grantReadWrite(baseLambdaRole);
     this.stateTable.grantReadWriteData(baseLambdaRole);
+    
+    // Add clustering bucket permissions if provided
+    if (props.clusteringBucketName) {
+      const clusteringBucket = s3.Bucket.fromBucketName(
+        this,
+        'ClusteringBucket',
+        props.clusteringBucketName
+      );
+      clusteringBucket.grantReadWrite(baseLambdaRole);
+    }
 
     // Create CloudWatch Log Group
     const logGroup = new logs.LogGroup(this, 'PublicCommentAnalysisLogs', {
@@ -98,6 +113,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
         REGULATIONS_GOV_API_KEY_SECRET_ARN: apiKeySecret.secretArn,
         OUTPUT_S3_BUCKET: commentsBucket.bucketName,
         STATE_TABLE_NAME: this.stateTable.tableName,
+        CLUSTERING_BUCKET: props.clusteringBucketName || '',
       },
       logGroup: logGroup,
       tracing: lambda.Tracing.ACTIVE, // Enable X-Ray tracing
@@ -137,6 +153,10 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       code: lambda.Code.fromAsset('lambda/combiner'),
       handler: 'index.lambda_handler',
       description: 'Combines processed comments into final output',
+      environment: {
+        ...lambdaConfig.environment,
+        CLUSTERING_BUCKET: props.clusteringBucketName || '',
+      }
     });
 
     // Create Step Functions state machine

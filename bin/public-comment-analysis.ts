@@ -3,6 +3,7 @@ import { PublicCommentAnalysisStack } from '../lib/public-comment-analysis-stack
 import { WebSocketStack } from '../lib/websocket-stack';
 import { RestApiStack } from '../lib/rest-api-stack';
 import { TestLambdaStack } from '../lib/test-lambda-stack';
+import { ClusteringStack } from '../lib/clustering-stack';
 
 const app = new cdk.App();
 
@@ -21,6 +22,13 @@ const publicCommentAnalysisStack = new PublicCommentAnalysisStack(app, 'PublicCo
     Project: 'USDA Comment Processing',
     Environment: 'Development',
   },
+  clusteringBucketName: `clustering-${process.env.CDK_DEFAULT_ACCOUNT}-${process.env.CDK_DEFAULT_REGION}`,
+});
+
+const clusteringStack = new ClusteringStack(app, 'ClusteringStack', {
+  outputBucketName: publicCommentAnalysisStack.outputBucketName,
+  stateMachineArn: publicCommentAnalysisStack.stateMachine.stateMachineArn,
+  env
 });
 
 const webSocketStack = new WebSocketStack(app, 'WebSocketStack', {
@@ -43,6 +51,7 @@ const testStack = new TestLambdaStack(app, 'TestLambdaStack', {
 });
 
 // Add dependencies
+clusteringStack.addDependency(publicCommentAnalysisStack);
 testStack.addDependency(restApiStack);
 restApiStack.addDependency(webSocketStack);
 restApiStack.addDependency(publicCommentAnalysisStack);

@@ -1,5 +1,3 @@
-# combiner lambda
-
 import json
 import os
 import boto3
@@ -23,11 +21,9 @@ def get_content_files(
         if 'Contents' in page:
             for obj in page['Contents']:
                 if obj['Key'].endswith('.csv'):
-                    # Extract worker and page info from filename
                     filename = obj['Key'].split('/')[-1]
                     if filename.startswith('worker_'):
                         try:
-                            # Parse worker_X_page_Y from filename
                             parts = filename.split('_')
                             worker_num = int(parts[1])
                             page_num = int(parts[3])
@@ -42,7 +38,6 @@ def get_content_files(
                             print(f"Skipping file with invalid format: {obj['Key']}")
                             continue
     
-    # Sort by page number, then worker number
     return sorted(content_files, key=lambda x: (x['page'], x['worker']))
 
 def combine_csv_files(
@@ -63,15 +58,12 @@ def combine_csv_files(
             content = response['Body'].read().decode('utf-8')
             file_data = StringIO(content)
             
-            # Read CSV
             reader = csv.DictReader(file_data)
             
-            # Initialize writer with headers from first file
             if csv_writer is None:
                 csv_writer = csv.DictWriter(combined_csv, fieldnames=reader.fieldnames)
                 csv_writer.writeheader()
             
-            # Write rows from this file
             rows = list(reader)
             total_rows += len(rows)
             for row in rows:
@@ -120,14 +112,12 @@ def aggregate_metadata(
                             worker_metadata.get('pageNumber', 0)
                         )
                         
-                        # Track rate limited workers
                         if worker_metadata.get('rateLimited', False):
                             metadata['rateLimitedWorkers'].append({
                                 'workerId': worker_metadata.get('workerId'),
                                 'pageNumber': worker_metadata.get('pageNumber')
                             })
                         
-                        # Track start and end times
                         completion_time = worker_metadata.get('completionTime')
                         if completion_time:
                             if metadata['startTime'] is None or completion_time < metadata['startTime']:
@@ -139,7 +129,6 @@ def aggregate_metadata(
                         print(f"Error reading metadata file {obj['Key']}: {str(e)}")
                         continue
     
-    # Sort worker metadata by page number and worker ID
     metadata['workerMetadata'].sort(
         key=lambda x: (x.get('pageNumber', 0), x.get('workerId', 0))
     )
@@ -181,6 +170,26 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             ContentType='text/csv'
         )
         final_files['comments'] = final_comments_key
+        
+        # Copy to clustering bucket if configured
+        clustering_bucket = os.environ.get('CLUSTERING_BUCKET')
+        if clustering_bucket:
+            try:
+                # Copy to before-clustering folder in clustering bucket
+                clustering_key = f"before-clustering/comments_{document_id}_{timestamp}.csv"
+                
+                # Copy the combined CSV to the clustering bucket
+                s3_client.copy_object(
+                    Bucket=clustering_bucket,
+                    Key=clustering_key,
+                    CopySource={'Bucket': bucket, 'Key': final_comments_key}
+                )
+                
+                print(f"Copied combined CSV to s3://{clustering_bucket}/{clustering_key}")
+                final_files['clustering'] = f"s3://{clustering_bucket}/{clustering_key}"
+            except Exception as e:
+                print(f"Error copying to clustering bucket: {str(e)}")
+                # Continue processing even if clustering copy fails
         
         # Combine attachments CSV files if any exist
         total_attachments = 0
