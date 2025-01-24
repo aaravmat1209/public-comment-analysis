@@ -18,6 +18,9 @@ export interface PublicCommentAnalysisStackProps extends cdk.StackProps {
 }
 
 export class PublicCommentAnalysisStack extends cdk.Stack {
+  public readonly stateMachine: sfn.StateMachine;
+  public readonly stateTable: dynamodb.Table;
+
   constructor(scope: Construct, id: string, props: PublicCommentAnalysisStackProps) {
     super(scope, id, props);
 
@@ -49,7 +52,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     });
 
     // Create DynamoDB table for processing state
-    const stateTable = new dynamodb.Table(this, 'ProcessingStateTable', {
+    this.stateTable = new dynamodb.Table(this, 'ProcessingStateTable', {
       partitionKey: { name: 'documentId', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'chunkId', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -76,7 +79,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     );    
     apiKeySecret.grantRead(baseLambdaRole);
     commentsBucket.grantReadWrite(baseLambdaRole);
-    stateTable.grantReadWriteData(baseLambdaRole);
+    this.stateTable.grantReadWriteData(baseLambdaRole);
 
     // Create CloudWatch Log Group
     const logGroup = new logs.LogGroup(this, 'PublicCommentAnalysisLogs', {
@@ -94,7 +97,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       environment: {
         REGULATIONS_GOV_API_KEY_SECRET_ARN: apiKeySecret.secretArn,
         OUTPUT_S3_BUCKET: commentsBucket.bucketName,
-        STATE_TABLE_NAME: stateTable.tableName,
+        STATE_TABLE_NAME: this.stateTable.tableName,
       },
       logGroup: logGroup,
       tracing: lambda.Tracing.ACTIVE, // Enable X-Ray tracing
@@ -252,7 +255,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       }))
       .next(batchProcessingLoop);
 
-    const stateMachine = new sfn.StateMachine(this, 'CommentProcessorStateMachine', {
+    this.stateMachine = new sfn.StateMachine(this, 'CommentProcessorStateMachine', {
       definition,
       timeout: cdk.Duration.days(7),
       tracingEnabled: true,
@@ -290,16 +293,16 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       new cloudwatch.GraphWidget({
         title: 'State Machine Executions',
         left: [
-          stateMachine.metricSucceeded(),
-          stateMachine.metricFailed(),
-          stateMachine.metricTimedOut(),
+          this.stateMachine.metricSucceeded(),
+          this.stateMachine.metricFailed(),
+          this.stateMachine.metricTimedOut(),
         ],
       })
     );
 
     // Create CloudWatch Alarms
     new cloudwatch.Alarm(this, 'StateMachineFailureAlarm', {
-      metric: stateMachine.metricFailed(),
+      metric: this.stateMachine.metricFailed(),
       threshold: 1,
       evaluationPeriods: 1,
       alarmDescription: 'Alert when State Machine execution fails',
@@ -307,7 +310,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
 
     // Outputs
     new cdk.CfnOutput(this, 'StateMachineArn', {
-      value: stateMachine.stateMachineArn,
+      value: this.stateMachine.stateMachineArn,
       description: 'ARN of the Step Functions state machine',
       exportName: 'CommentProcessorStateMachineArn',
     });
@@ -319,7 +322,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'StateTableName', {
-      value: stateTable.tableName,
+      value: this.stateTable.tableName,
       description: 'Name of the DynamoDB state table',
       exportName: 'CommentProcessorStateTableName',
     });
