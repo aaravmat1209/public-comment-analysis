@@ -23,22 +23,7 @@ export class WebSocketStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: WebSocketStackProps) {
     super(scope, id, props);
 
-    // Create WebSocket API
-    this.webSocketApi = new apigateway.WebSocketApi(this, 'CommentProcessorWebSocket', {
-      apiName: 'CommentProcessorWebSocket',
-    });
-
-    // Create stage
-    this.stage = new apigateway.WebSocketStage(this, 'DevStage', {
-      webSocketApi: this.webSocketApi,
-      stageName: 'dev',
-      autoDeploy: true,
-    });
-
-    // Store the WebSocket endpoint
-    this.webSocketEndpoint = `${this.webSocketApi.apiEndpoint}/${this.stage.stageName}`;
-
-    // Create DynamoDB table for connections
+    // Create DynamoDB table for connections with a TTL
     this.connectionsTable = new dynamodb.Table(this, 'ConnectionsTable', {
       partitionKey: {
         name: 'connectionId',
@@ -47,6 +32,11 @@ export class WebSocketStack extends cdk.Stack {
       timeToLiveAttribute: 'ttl',
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    });
+
+    // Create WebSocket API first
+    this.webSocketApi = new apigateway.WebSocketApi(this, 'CommentProcessorWebSocket', {
+      apiName: 'CommentProcessorWebSocket',
     });
 
     // Create WebSocket layer
@@ -62,7 +52,6 @@ export class WebSocketStack extends cdk.Stack {
       layers: [webSocketLayer],
       environment: {
         CONNECTIONS_TABLE_NAME: this.connectionsTable.tableName,
-        WEBSOCKET_API_ENDPOINT: this.webSocketEndpoint,
       },
     };
 
@@ -79,16 +68,45 @@ export class WebSocketStack extends cdk.Stack {
       code: lambda.Code.fromAsset('lambda/websocket'),
     });
 
-    // Create routes
-    this.webSocketApi.addRoute('$connect', {
-      integration: new integrations.WebSocketLambdaIntegration('ConnectIntegration', connectHandler)
+    // Grant DynamoDB permissions
+    this.connectionsTable.grantReadWriteData(connectHandler);
+    this.connectionsTable.grantReadWriteData(disconnectHandler);
+
+    // Create stage
+    this.stage = new apigateway.WebSocketStage(this, 'DevStage', {
+      webSocketApi: this.webSocketApi,
+      stageName: 'dev',
+      autoDeploy: true,
     });
 
-    this.webSocketApi.addRoute('$disconnect', {
-      integration: new integrations.WebSocketLambdaIntegration('DisconnectIntegration', disconnectHandler)
+    // Store the WebSocket endpoint
+    this.webSocketEndpoint = `${this.webSocketApi.apiEndpoint}/${this.stage.stageName}`;
+
+    // Update environment variables with endpoint
+    const connectionManagementArn = `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/POST/@connections/*`;
+
+    // Create super permissive WebSocket management policy for testing
+    // Update this section in websocket-stack.ts
+
+    const webSocketManagementPolicy = new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'execute-api:ManageConnections',
+        'execute-api:Invoke'
+      ],
+      resources: [
+        // Specific POST permission for managing connections
+        `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/POST/@connections/*`,
+        // Specific GET permission for getting connection info
+        `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/GET/@connections/*`,
+        // Specific DELETE permission for cleaning up connections
+        `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/DELETE/@connections/*`,
+        // General permissions for the stage
+        `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/*`,
+      ]
     });
 
-    // Create Progress Tracker
+    // Add API Gateway endpoint URL to the environment variables
     this.progressTracker = new lambda.Function(this, 'ProgressTrackerHandler', {
       ...commonLambdaProps,
       handler: 'index.lambda_handler',
@@ -96,7 +114,25 @@ export class WebSocketStack extends cdk.Stack {
       environment: {
         ...commonLambdaProps.environment,
         STATE_TABLE_NAME: props.stateTable.tableName,
+        WEBSOCKET_API_ENDPOINT: this.webSocketEndpoint,
+        API_GATEWAY_ENDPOINT: `https://${this.webSocketApi.apiId}.execute-api.${this.region}.amazonaws.com/${this.stage.stageName}`, // Add this
       },
+    });
+
+    // Add WebSocket permissions to Progress Tracker
+    this.progressTracker.addToRolePolicy(webSocketManagementPolicy);
+
+    // Grant additional permissions
+    this.connectionsTable.grantReadWriteData(this.progressTracker);
+    props.stateTable.grantReadWriteData(this.progressTracker);
+
+    // Create routes after all permissions are set
+    this.webSocketApi.addRoute('$connect', {
+      integration: new integrations.WebSocketLambdaIntegration('ConnectIntegration', connectHandler),
+    });
+
+    this.webSocketApi.addRoute('$disconnect', {
+      integration: new integrations.WebSocketLambdaIntegration('DisconnectIntegration', disconnectHandler),
     });
 
     // Create EventBridge rule
@@ -111,31 +147,6 @@ export class WebSocketStack extends cdk.Stack {
     });
 
     stateMachineRule.addTarget(new targets.LambdaFunction(this.progressTracker));
-
-    // Grant permissions
-    this.connectionsTable.grantReadWriteData(connectHandler);
-    this.connectionsTable.grantReadWriteData(disconnectHandler);
-    this.connectionsTable.grantReadWriteData(this.progressTracker);
-    props.stateTable.grantReadWriteData(this.progressTracker);
-
-    // Grant WebSocket management permissions - critical fix here
-    const webSocketPolicy = new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      actions: [
-        'execute-api:ManageConnections',
-        'execute-api:Invoke'
-      ],
-      resources: [
-        // The complete set of required permissions for WebSocket operations
-        `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/POST/@connections/*`,
-        `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/GET/@connections/*`,
-        `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/DELETE/@connections/*`,
-        `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/@connections/*`,
-        `arn:aws:execute-api:${this.region}:${this.account}:${this.webSocketApi.apiId}/${this.stage.stageName}/*`
-      ]
-    });
-
-    this.progressTracker.addToRolePolicy(webSocketPolicy);
 
     // Export outputs
     new cdk.CfnOutput(this, 'WebSocketEndpoint', {

@@ -1,5 +1,3 @@
-# test-function lambda
-
 import json
 import os
 import boto3
@@ -12,9 +10,9 @@ from typing import Dict, Any, List
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Test the document processing backend"""
     try:
-        # Configuration - Replace these with your actual endpoints
-        api_endpoint = os.environ['API_ENDPOINT']  # REST API endpoint
-        websocket_endpoint = os.environ['WEBSOCKET_ENDPOINT']  # WebSocket endpoint
+        # Configuration
+        api_endpoint = os.environ['API_ENDPOINT']
+        websocket_endpoint = os.environ['WEBSOCKET_ENDPOINT']
         
         # Test document IDs
         document_ids = ['EPA-R10-OW-2017-0369-0001']
@@ -24,15 +22,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         # WebSocket message handler
         def on_message(ws, message):
-            data = json.loads(message)
-            if data['type'] == 'PROGRESS_UPDATE':
-                doc_id = data['documentId']
-                progress_updates[doc_id] = {
-                    'status': data['currentState'],
-                    'progress': data.get('progress', 0),
-                    'timestamp': data['timestamp']
-                }
-                print(f"Progress update for {doc_id}: {progress_updates[doc_id]}")
+            try:
+                data = json.loads(message)
+                if data['type'] == 'PROGRESS_UPDATE':
+                    doc_id = data['documentId']
+                    progress_updates[doc_id] = {
+                        'status': data['status'],
+                        'progress': data.get('progress', 0),
+                        'timestamp': data['timestamp']
+                    }
+                    print(f"Progress update for {doc_id}: {progress_updates[doc_id]}")
+            except Exception as e:
+                print(f"Error processing message: {str(e)}")
+                print(f"Message content: {message}")
         
         # WebSocket error handler
         def on_error(ws, error):
@@ -123,13 +125,3 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'error': str(e)
             })
         }
-
-# For local testing
-if __name__ == '__main__':
-    # Set environment variables
-    os.environ['API_ENDPOINT'] = 'https://your-api-endpoint'
-    os.environ['WEBSOCKET_ENDPOINT'] = 'wss://your-websocket-endpoint'
-    
-    # Run the test
-    result = lambda_handler({}, None)
-    print(json.dumps(result, indent=2))

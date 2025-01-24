@@ -1,9 +1,14 @@
 import json
 import os
 import boto3
+import logging
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 from websocket_utils import create_websocket_service
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
 
@@ -19,7 +24,7 @@ def map_state_to_progress(status: str, previous_status: str = None) -> int:
     return PROGRESS_MAP.get(status, 0)
 
 def extract_document_id(execution_input: str) -> Optional[str]:
-    """Extract document ID from execution input"""
+    print("Extracting document ID from execution input")
     try:
         input_data = json.loads(execution_input)
         return input_data.get('documentId')
@@ -30,7 +35,7 @@ def extract_document_id(execution_input: str) -> Optional[str]:
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Handle Step Functions execution status change events"""
     try:
-        print(f"Received event: {json.dumps(event)}")
+        logger.info(f"Received event: {json.dumps(event)}")
         
         detail = event['detail']
         execution_arn = detail['executionArn']
@@ -38,8 +43,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         # Get document ID
         document_id = extract_document_id(detail.get('input', '{}'))
+        logger.info(f"Received Document ID: [{document_id}]")
         if not document_id:
-            print("Could not extract document ID from execution input")
+            logger.error("Could not extract document ID from execution input")
             return {
                 'statusCode': 400,
                 'error': 'Missing document ID in execution input'
@@ -48,13 +54,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Get state table name
         state_table_name = os.environ.get('STATE_TABLE_NAME')
         if not state_table_name:
-            print("STATE_TABLE_NAME environment variable not set")
+            logger.error("STATE_TABLE_NAME environment variable not set")
             return {
                 'statusCode': 500,
                 'error': 'Missing STATE_TABLE_NAME environment variable'
             }
             
-        # Get current state from DynamoDB
+        logger.info(f"Getting current state from DynamoDB table {state_table_name}")
         state_table = dynamodb.Table(state_table_name)
         response = state_table.get_item(
             Key={
@@ -80,7 +86,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if status in ['FAILED', 'TIMED_OUT', 'ABORTED']:
             new_state['error'] = detail.get('cause', 'Execution failed')
             
-        # Update state in DynamoDB
+        logger.info(f"Updating state in DynamoDB...")
         state_table.update_item(
             Key={
                 'documentId': document_id,
@@ -95,8 +101,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             }
         )
         
-        # Try to send WebSocket update
-        ws_service = create_websocket_service()
+        logger.info("Sending WebSocket update...")
+        
+        # Try to send WebSocket update with API Gateway endpoint
+        ws_endpoint = os.environ.get('WEBSOCKET_API_ENDPOINT')
+        api_endpoint = os.environ.get('API_GATEWAY_ENDPOINT')
+        connections_table = os.environ.get('CONNECTIONS_TABLE_NAME')
+
+        logger.info(f"Creating WebSocket service with endpoint {api_endpoint or ws_endpoint}")
+        
+        ws_service = create_websocket_service(
+            endpoint=api_endpoint or ws_endpoint,
+            connections_table_name=connections_table
+        )
         if ws_service:
             try:
                 ws_service.broadcast_message({
@@ -109,9 +126,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     'timestamp': new_state['lastUpdated']
                 })
             except Exception as e:
-                print(f"Error sending WebSocket update: {str(e)}")
+                logger.error(f"Error sending WebSocket update: {str(e)}")
         else:
-            print("WebSocket service not available - skipping real-time updates")
+            logger.warning("WebSocket service not available - skipping real-time updates")
         
         return {
             'statusCode': 200,
@@ -122,7 +139,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
         
     except Exception as e:
-        print(f"Error handling execution status change: {str(e)}")
+        logger.error(f"Error handling execution status change: {str(e)}", exc_info=True)
         return {
             'statusCode': 500,
             'error': str(e)
