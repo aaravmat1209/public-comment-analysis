@@ -46,21 +46,37 @@ def process_comments(input_file, output_file, n_clusters=10):
         logging.info("Only one cluster found. Silhouette score not applicable.")
 
     # Save results to output file
-    logging.info("Saving results to output file...")
-    df.to_csv("/opt/ml/processing/output/clustered_results.csv", index=False)
+    logging.info(f"Saving results to output file: {output_file}")
+    df.to_csv(output_file, index=False)
     logging.info(f"Results saved to {output_file}")
 
 def main(input_data, output_data, object_name, n_clusters):
+    """Process input comments file and save clustered results."""
     # Input file path
     input_file = os.path.join(input_data, object_name)
-    logging.info(f"Input file path: {input_file}")
+    logging.info(f"Processing input file: {input_file}")
 
-    # Output file path
-    output_csv = os.path.join(output_data, 'clustered_results.csv')
-    logging.info(f"Output file path: {output_csv}")
+    # Extract document ID from input filename (format: comments_DOCUMENT-ID_timestamp.csv)
+    try:
+        # Updated to handle both possible input formats
+        if 'comments_' in object_name:
+            doc_id = object_name.split('comments_')[1].split('_')[0]
+        else:
+            # Fallback to directory structure if filename doesn't contain ID
+            doc_id = os.path.dirname(input_file).split('/')[-2]
+        logging.info(f"Extracted document ID: {doc_id}")
+    except Exception as e:
+        logging.error(f"Error extracting document ID from {object_name}: {str(e)}")
+        raise
+
+    # Create output filename with document ID
+    output_filename = f'clustered_results_{doc_id}.csv'
+    output_path = os.path.join(output_data, output_filename)
+    logging.info(f"Will save clustered results to: {output_path}")
 
     # Process the comments
-    process_comments(input_file, output_csv, n_clusters=n_clusters)
+    process_comments(input_file, output_path, n_clusters=n_clusters)
+    logging.info(f"Successfully saved clustered results as {output_filename}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process comments for clustering.")

@@ -159,7 +159,7 @@ def lambda_handler(event, context):
                         "--input-data", "/opt/ml/processing/input/data",
                         "--output-data", "/opt/ml/processing/output",
                         "--object-name", os.path.basename(key),
-                        "--n-clusters", "10"
+                        "--n-clusters", "10",
                     ]
                 },
                 ProcessingInputs=[
@@ -194,6 +194,10 @@ def lambda_handler(event, context):
                         }
                     ]
                 },
+                Tags=[{
+                    'Key': 'DocumentId',
+                    'Value': document_id
+                }],
                 RoleArn=os.environ['ROLE_ARN']
             )
 

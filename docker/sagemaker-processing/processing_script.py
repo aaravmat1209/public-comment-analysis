@@ -55,8 +55,12 @@ def main(input_data, output_data, object_name, n_clusters):
     input_file = os.path.join(input_data, object_name)
     logging.info(f"Input file path: {input_file}")
 
-    # Output file path
-    output_csv = os.path.join(output_data, 'clustered_results.csv')
+    # Get document ID from input filename
+    # Expected format: comments_DOCUMENT-ID_timestamp.csv
+    doc_id = object_name.split('comments_')[1].split('_')[0]
+    
+    # Output file path - include document ID in output
+    output_csv = os.path.join(output_data, f'clustered_results_{doc_id}.csv')
     logging.info(f"Output file path: {output_csv}")
 
     # Process the comments

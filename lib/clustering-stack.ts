@@ -90,6 +90,21 @@ export class ClusteringStack extends cdk.Stack {
       resources: [`arn:aws:ecr:${this.region}:${this.account}:repository/sagemaker-processing-image`]
     }));
 
+    const sagemakerPolicy = new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'sagemaker:CreateProcessingJob',
+        'sagemaker:DescribeProcessingJob',
+        'sagemaker:StopProcessingJob',
+        'sagemaker:ListProcessingJobs',
+        'sagemaker:AddTags',  // Add permission for tagging
+        'sagemaker:DeleteTags'
+      ],
+      resources: [
+        `arn:aws:sagemaker:${this.region}:${this.account}:processing-job/*`
+      ]
+    });
+
     // Create base Lambda role
     const baseLambdaRole = new iam.Role(this, 'ClusteringLambdaRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -149,6 +164,8 @@ export class ClusteringStack extends cdk.Stack {
       },
       layers: [webSocketLayer],  // Add WebSocket layer
     });
+
+    processingLambda.addToRolePolicy(sagemakerPolicy);
     
     props.stateTable.grantReadWriteData(processingLambda);
     props.connectionsTable.grantReadWriteData(processingLambda);
@@ -186,27 +203,34 @@ export class ClusteringStack extends cdk.Stack {
     }));
 
     // Create analysis Lambda
+    // Create a layer for the Python dependencies
+    const analysisLayer = new lambda.LayerVersion(this, 'AnalysisLayer', {
+      code: lambda.Code.fromAsset('lambda/clustering-analyzer', {
+        bundling: {
+          image: lambda.Runtime.PYTHON_3_9.bundlingImage,
+          command: [
+            'bash', '-c',
+            'pip install -r requirements.txt -t /asset-output/python'
+          ]
+        }
+      }),
+      compatibleRuntimes: [lambda.Runtime.PYTHON_3_9],
+      description: 'Dependencies for analysis lambda',
+    });
+
     const analysisLambda = new lambda.Function(this, 'AnalysisLambda', {
       runtime: lambda.Runtime.PYTHON_3_9,
-      code: lambda.Code.fromAsset('lambda/clustering-analyzer', {
-              bundling: {
-                image: lambda.Runtime.PYTHON_3_9.bundlingImage,
-                command: [
-                  'bash', '-c',
-                  'pip install -r requirements.txt -t /asset-output && cp index.py /asset-output'
-                ]
-              }
-      }),
+      code: lambda.Code.fromAsset('lambda/clustering-analyzer'),
       handler: 'index.lambda_handler',
       role: baseLambdaRole,
-      layers: [webSocketLayer],
+      layers: [webSocketLayer, analysisLayer],
       timeout: cdk.Duration.minutes(5),
       memorySize: 1024,
       environment: {
-        STATE_TABLE_NAME: props.stateTable.tableName,  // Add state table name
-        WEBSOCKET_API_ENDPOINT: props.webSocketEndpoint,  // Add WebSocket endpoint
+        STATE_TABLE_NAME: props.stateTable.tableName,
+        WEBSOCKET_API_ENDPOINT: props.webSocketEndpoint,
         API_GATEWAY_ENDPOINT: props.apiGatewayEndpoint,
-        CONNECTIONS_TABLE_NAME: props.connectionsTable.tableName  // Add connections table name
+        CONNECTIONS_TABLE_NAME: props.connectionsTable.tableName
       },
     });
 

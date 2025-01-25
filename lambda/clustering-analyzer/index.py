@@ -14,13 +14,22 @@ s3_client = boto3.client("s3")
 bedrock_client = boto3.client("bedrock-runtime", region_name="us-west-2")
 
 def extract_document_id(object_key: str) -> str:
-    """Extract document ID from the object key."""
+    """Extract document ID from the clustered results filename."""
+    logger.info(f"Attempting to extract document ID from: {object_key}")
+    
     try:
-        # Expected format: after-clustering/clustered_results_DOCUMENT-ID_timestamp.csv
-        parts = object_key.split('results_')[1].split('_')[0]
-        return parts
-    except Exception:
-        return None
+        # Expected format: after-clustering/clustered_results_DOCUMENT-ID.csv
+        if 'clustered_results_' not in object_key:
+            raise ValueError(f"Unexpected file pattern. Expected 'clustered_results_' in filename: {object_key}")
+            
+        doc_id = object_key.split('clustered_results_')[1].split('.')[0]
+        logger.info(f"Successfully extracted document ID: {doc_id}")
+        return doc_id
+            
+    except Exception as e:
+        logger.error(f"Error extracting document ID from {object_key}: {str(e)}")
+        raise ValueError(f"Could not extract document ID from key: {object_key}")
+
 
 def update_processing_state(document_id: str, status: str, error: str = None) -> None:
     """Update processing state in DynamoDB"""
@@ -188,16 +197,19 @@ def build_prompt(clusters_data):
 
 def lambda_handler(event, context):
     """Process clustered results and generate analysis"""
-    document_id = None
     try:
         record = event["Records"][0]
         bucket_name = record["s3"]["bucket"]["name"]
         object_key = record["s3"]["object"]["key"]
         
+        # Verify we're processing a file from the correct directory
+        if not object_key.startswith('after-clustering/'):
+            raise ValueError(f"Expected file in after-clustering/ directory, got: {object_key}")
+            
+        logger.info(f"Processing clustering results file: s3://{bucket_name}/{object_key}")
+        
         # Extract document ID
         document_id = extract_document_id(object_key)
-        if not document_id:
-            raise ValueError(f"Could not extract document ID from key: {object_key}")
             
         # Send initial progress update
         send_progress_update(document_id, 'RUNNING')
