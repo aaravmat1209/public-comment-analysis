@@ -3,7 +3,7 @@ import os
 import boto3
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 # Set up logging
 logger = logging.getLogger()
@@ -12,6 +12,7 @@ logger.setLevel(logging.INFO)
 # Initialize AWS clients
 stepfunctions = boto3.client('stepfunctions')
 dynamodb = boto3.resource('dynamodb')
+s3_client = boto3.client('s3')
 state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
 
 def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -26,50 +27,51 @@ def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
         'body': json.dumps(body)
     }
 
-def log_request_details(event: Dict[str, Any]) -> None:
-    """Log detailed information about the incoming request"""
-    logger.info("Request Details:")
-    logger.info(f"Method: {event.get('httpMethod')}")
-    logger.info(f"Path: {event.get('path')}")
-    logger.info(f"Headers: {json.dumps(event.get('headers', {}))}")
-    logger.info(f"Query Parameters: {json.dumps(event.get('queryStringParameters', {}))}")
-    
-    # Log request body if present, safely handling potential JSON parsing errors
-    if 'body' in event:
-        try:
-            body = json.loads(event['body'])
-            logger.info(f"Request Body: {json.dumps(body)}")
-        except json.JSONDecodeError:
-            logger.warning("Unable to parse request body as JSON")
-            logger.info(f"Raw Body: {event['body']}")
+def get_analysis_json(document_id: str, cluster_bucket: str) -> Optional[Dict[str, Any]]:
+    """Retrieve analysis JSON from clustering bucket if available."""
+    try:
+        # Look for analysis JSON file
+        response = s3_client.list_objects_v2(
+            Bucket=cluster_bucket,
+            Prefix=f"analysis-json/comments_{document_id}"
+        )
+        
+        if 'Contents' in response:
+            # Get the latest analysis file
+            latest_file = max(response['Contents'], key=lambda x: x['LastModified'])
+            file_content = s3_client.get_object(
+                Bucket=cluster_bucket,
+                Key=latest_file['Key']
+            )
+            return json.loads(file_content['Body'].read().decode('utf-8'))
+    except Exception as e:
+        logger.warning(f"Error retrieving analysis JSON: {str(e)}")
+    return None
 
 def submit_document_for_processing(document_id: str) -> Dict[str, Any]:
     """Submit a single document for processing"""
     logger.info(f"Processing submission for document ID: {document_id}")
     
     try:
-        # Log DynamoDB operation start
-        logger.debug(f"Initializing state in DynamoDB for document {document_id}")
-        current_time = datetime.now(timezone.utc)
-        
         # Initialize state in DynamoDB
+        current_time = datetime.now(timezone.utc)
+        initial_state = {
+            'status': 'QUEUED',
+            'progress': 0,
+            'stage': 'comment_processing',
+            'startTime': current_time.isoformat(),
+            'lastUpdated': current_time.isoformat()
+        }
+        
         state_table.put_item(
             Item={
                 'documentId': document_id,
                 'chunkId': 'metadata',
-                'state': json.dumps({
-                    'status': 'QUEUED',
-                    'progress': 0,
-                    'startTime': current_time.isoformat(),
-                    'lastUpdated': current_time.isoformat()
-                }),
+                'state': json.dumps(initial_state),
                 'ttl': int(current_time.timestamp()) + (7 * 24 * 60 * 60)  # 7 days TTL
             }
         )
         logger.info(f"Successfully initialized state for document {document_id}")
-        
-        # Log Step Functions execution start
-        logger.debug(f"Starting Step Functions execution for document {document_id}")
         
         # Start Step Functions execution
         execution = stepfunctions.start_execution(
@@ -113,7 +115,6 @@ def handle_submission(event: Dict[str, Any]) -> Dict[str, Any]:
         
         results = [submit_document_for_processing(doc_id) for doc_id in document_ids]
         
-        # Log submission results
         successful = len([r for r in results if r['status'] == 'QUEUED'])
         failed = len([r for r in results if r['status'] == 'FAILED'])
         logger.info(f"Submission complete: {successful} successful, {failed} failed")
@@ -136,9 +137,6 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Checking status for document: {document_id}")
     
     try:
-        # Log DynamoDB operation start
-        logger.debug(f"Retrieving state from DynamoDB for document {document_id}")
-        
         # Get status from DynamoDB
         response = state_table.get_item(
             Key={
@@ -153,12 +151,24 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
         
         state = json.loads(response['Item']['state'])
         logger.info(f"Retrieved status for document {document_id}: {state['status']}")
-        logger.debug(f"Full state: {json.dumps(state)}")
         
-        return create_response(200, {
+        response_body = {
             'documentId': document_id,
             'status': state
-        })
+        }
+        
+        # Get clustering analysis if final stage is complete
+        cluster_bucket = os.environ.get('CLUSTERING_BUCKET')
+        if (cluster_bucket and 
+            state.get('stage') == 'analysis' and 
+            state['status'] == 'SUCCEEDED' and 
+            state.get('progress', 0) >= 100):
+            
+            analysis = get_analysis_json(document_id, cluster_bucket)
+            if analysis:
+                response_body['analysis'] = analysis
+        
+        return create_response(200, response_body)
         
     except Exception as e:
         logger.error(f"Error checking status for document {document_id}", exc_info=True)
@@ -166,12 +176,9 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Handle document submission and status checking"""
-    # Log initial request details
     logger.info("Request received")
-    log_request_details(event)
     
     try:
-        # Handle different HTTP methods
         if event['httpMethod'] == 'POST':
             return handle_submission(event)
         elif event['httpMethod'] == 'GET':

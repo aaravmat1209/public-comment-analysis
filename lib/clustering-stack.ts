@@ -1,4 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
+import * as apigateway from '@aws-cdk/aws-apigatewayv2-alpha';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -7,8 +9,14 @@ import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import { Construct } from 'constructs';
 
 export interface ClusteringStackProps extends cdk.StackProps {
-  outputBucketName: string; // The bucket from comment processing
+  outputBucketName: string;
   stateMachineArn: string;
+  stateTable: dynamodb.Table;  // Add state table
+  webSocketEndpoint: string;  // Add WebSocket endpoint
+  apiGatewayEndpoint: string;
+  connectionsTable: dynamodb.Table;  // Add connections table
+  webSocketApi: apigateway.WebSocketApi;
+  stageName: string; 
 }
 
 export class ClusteringStack extends cdk.Stack {
@@ -117,6 +125,12 @@ export class ClusteringStack extends cdk.Stack {
       resources: ['*'],
     }));
 
+    const webSocketLayer = new lambda.LayerVersion(this, 'WebSocketLayer', {
+      code: lambda.Code.fromAsset('lambda/layers/websocket'),
+      compatibleRuntimes: [lambda.Runtime.PYTHON_3_9],
+      description: 'WebSocket utilities layer',
+    });
+
     // Create processing Lambda
     const processingLambda = new lambda.Function(this, 'ProcessingLambda', {
       runtime: lambda.Runtime.PYTHON_3_9,
@@ -128,8 +142,48 @@ export class ClusteringStack extends cdk.Stack {
       environment: {
         IMAGE_URI: '904233123149.dkr.ecr.us-west-2.amazonaws.com/sagemaker-processing-image:latest',
         ROLE_ARN: sagemakerRole.roleArn,
+        STATE_TABLE_NAME: props.stateTable.tableName,  // Add state table name
+        WEBSOCKET_API_ENDPOINT: props.webSocketEndpoint,  // Add WebSocket endpoint
+        API_GATEWAY_ENDPOINT: props.apiGatewayEndpoint,
+        CONNECTIONS_TABLE_NAME: props.connectionsTable.tableName  // Add connections table name
       },
+      layers: [webSocketLayer],  // Add WebSocket layer
     });
+    
+    props.stateTable.grantReadWriteData(processingLambda);
+    props.connectionsTable.grantReadWriteData(processingLambda);
+
+    // Explicit permissions for Scan operation
+    processingLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:Scan',
+        'dynamodb:UpdateItem'
+      ],
+      resources: [
+        props.connectionsTable.tableArn,
+        props.stateTable.tableArn
+      ]
+    }));
+
+    // Add WebSocket management permissions to Lambda role
+    processingLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'execute-api:ManageConnections',
+        'execute-api:Invoke'
+      ],
+      resources: [
+        // Specific POST permission for managing connections
+        `arn:aws:execute-api:${this.region}:${this.account}:${props.webSocketApi.apiId}/${props.stageName}/POST/@connections/*`,
+        // Specific GET permission for getting connection info
+        `arn:aws:execute-api:${this.region}:${this.account}:${props.webSocketApi.apiId}/${props.stageName}/GET/@connections/*`,
+        // Specific DELETE permission for cleaning up connections
+        `arn:aws:execute-api:${this.region}:${this.account}:${props.webSocketApi.apiId}/${props.stageName}/DELETE/@connections/*`,
+        // General permissions for the stage
+        `arn:aws:execute-api:${this.region}:${this.account}:${props.webSocketApi.apiId}/${props.stageName}/*`
+      ]
+    }));
 
     // Create analysis Lambda
     const analysisLambda = new lambda.Function(this, 'AnalysisLambda', {
@@ -145,9 +199,51 @@ export class ClusteringStack extends cdk.Stack {
       }),
       handler: 'index.lambda_handler',
       role: baseLambdaRole,
+      layers: [webSocketLayer],
       timeout: cdk.Duration.minutes(5),
       memorySize: 1024,
+      environment: {
+        STATE_TABLE_NAME: props.stateTable.tableName,  // Add state table name
+        WEBSOCKET_API_ENDPOINT: props.webSocketEndpoint,  // Add WebSocket endpoint
+        API_GATEWAY_ENDPOINT: props.apiGatewayEndpoint,
+        CONNECTIONS_TABLE_NAME: props.connectionsTable.tableName  // Add connections table name
+      },
     });
+
+    props.stateTable.grantReadWriteData(analysisLambda);
+    props.connectionsTable.grantReadWriteData(analysisLambda);
+
+    // Explicit permissions for Scan operation
+    analysisLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:Scan',
+        'dynamodb:UpdateItem'
+      ],
+      resources: [
+        props.connectionsTable.tableArn,
+        props.stateTable.tableArn
+      ]
+    }));
+
+    // Add WebSocket management permissions to Lambda role
+    analysisLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'execute-api:ManageConnections',
+        'execute-api:Invoke'
+      ],
+      resources: [
+        // Specific POST permission for managing connections
+        `arn:aws:execute-api:${this.region}:${this.account}:${props.webSocketApi.apiId}/${props.stageName}/POST/@connections/*`,
+        // Specific GET permission for getting connection info
+        `arn:aws:execute-api:${this.region}:${this.account}:${props.webSocketApi.apiId}/${props.stageName}/GET/@connections/*`,
+        // Specific DELETE permission for cleaning up connections
+        `arn:aws:execute-api:${this.region}:${this.account}:${props.webSocketApi.apiId}/${props.stageName}/DELETE/@connections/*`,
+        // General permissions for the stage
+        `arn:aws:execute-api:${this.region}:${this.account}:${props.webSocketApi.apiId}/${props.stageName}/*`
+      ]
+    }));
 
     // Add S3 triggers
     // Trigger processing Lambda when files are added to before-clustering/

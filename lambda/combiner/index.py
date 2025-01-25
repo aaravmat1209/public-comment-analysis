@@ -173,6 +173,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         # Copy to clustering bucket if configured
         clustering_bucket = os.environ.get('CLUSTERING_BUCKET')
+        print(f"Copying to clustering bucket {clustering_bucket}")
         if clustering_bucket:
             try:
                 # Copy to before-clustering folder in clustering bucket

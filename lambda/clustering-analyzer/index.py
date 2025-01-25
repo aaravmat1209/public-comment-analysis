@@ -3,7 +3,9 @@ import boto3
 import os
 import logging
 import pandas as pd
+from datetime import datetime, timezone
 from botocore.exceptions import ClientError
+from websocket_utils import create_websocket_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -11,50 +13,104 @@ logger = logging.getLogger(__name__)
 s3_client = boto3.client("s3")
 bedrock_client = boto3.client("bedrock-runtime", region_name="us-west-2")
 
-def invoke_bedrock(prompt, model_id="anthropic.claude-3-5-sonnet-20241022-v2:0", max_length=2048):
-    """
-    Invokes a Bedrock Claude model with a text prompt.
-    Returns the model's textual response.
-    """ 
-    request_body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": max_length,
-        "temperature": 0.1,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    })
-
+def extract_document_id(object_key: str) -> str:
+    """Extract document ID from the object key."""
     try:
-        logger.info("Invoking Bedrock model...")
+        # Expected format: after-clustering/clustered_results_DOCUMENT-ID_timestamp.csv
+        parts = object_key.split('results_')[1].split('_')[0]
+        return parts
+    except Exception:
+        return None
+
+def update_processing_state(document_id: str, status: str, error: str = None) -> None:
+    """Update processing state in DynamoDB"""
+    try:
+        dynamodb = boto3.resource('dynamodb')
+        state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
+        
+        state = {
+            'status': status,
+            'stage': 'analysis',
+            'progress': 100 if status == 'SUCCEEDED' else 90,
+            'lastUpdated': datetime.now(timezone.utc).isoformat()
+        }
+        
+        if error:
+            state['error'] = error
+            
+        state_table.update_item(
+            Key={
+                'documentId': document_id,
+                'chunkId': 'metadata'
+            },
+            UpdateExpression='SET #state = :state',
+            ExpressionAttributeNames={
+                '#state': 'state'
+            },
+            ExpressionAttributeValues={
+                ':state': json.dumps(state)
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error updating state: {str(e)}")
+
+def send_progress_update(document_id: str, status: str, error: str = None) -> None:
+    """Send analysis progress update via WebSocket"""
+    try:
+        # Initialize WebSocket service
+        ws_endpoint = os.environ.get('WEBSOCKET_API_ENDPOINT')
+        api_endpoint = os.environ.get('API_GATEWAY_ENDPOINT')
+        connections_table = os.environ.get('CONNECTIONS_TABLE_NAME')
+
+        ws_service = create_websocket_service(
+            endpoint=api_endpoint or ws_endpoint,
+            connections_table_name=connections_table
+        )
+        
+        if ws_service:
+            ws_service.broadcast_message({
+                'type': 'PROGRESS_UPDATE',
+                'documentId': document_id,
+                'stage': 'analysis',
+                'status': status,
+                'progress': 100 if status == 'SUCCEEDED' else 90,
+                'error': error,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+    except Exception as e:
+        logger.error(f"Error sending WebSocket update: {str(e)}")
+
+def invoke_bedrock(prompt, model_id="anthropic.claude-3-5-sonnet-20241022-v2:0", max_length=2048):
+    """Invoke Bedrock model with error handling"""
+    try:
+        request_body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": max_length,
+            "temperature": 0.1,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ]
+        })
+
         response = bedrock_client.invoke_model(
             modelId=model_id,
             body=request_body
         )
+        
         model_response = json.loads(response["body"].read())
-
-        # Attempt to parse the known structure from Claude
-        if "content" in model_response and isinstance(model_response["content"], list):
-            # Typically: model_response["content"][0]["text"]
-            return model_response["content"][0]["text"].strip()
-
-        # Fallback logic, if the structure is different:
-        if "completion" in model_response:
-            return model_response["completion"].strip()
-
-        return json.dumps({"error": "No completion or content in response."})
-
-    except (ClientError, Exception) as e:
-        logger.error(f"Error invoking model: {e}")
-        raise e
+        return model_response["content"][0]["text"].strip()
+        
+    except Exception as e:
+        logger.error(f"Error invoking Bedrock: {str(e)}")
+        raise
 
 def build_prompt(clusters_data):
     """
@@ -71,34 +127,31 @@ def build_prompt(clusters_data):
          }
       ]
     No extra commentary or text.
-
     We also instruct that each cluster must appear, no merging or omission.
     """
-
     # Provide example JSON structure up front
     example_json_structure = """
-{
-  "clusters": [
     {
-      "clusterName": "Worker Safety Standards",
-      "clusterDescription": "Describes the main theme or focus of this cluster.",
-      "overallSentiment": "Positive",
-      "repOrg": ["Southern Poverty Law Center", "Farmworker Justice"],
-      "recActions": ["Withdraw proposed rule", "Implement safety standards"],
-      "relComments": ["comment1", "comment2", "comment3"]
-    },
-    {
-      "clusterName": "Economic Impact",
-      "clusterDescription": "Describes how new regulations might affect the economy.",
-      "overallSentiment": "Neutral",
-      "repOrg": ["American Farm Bureau Federation"],
-      "recActions": ["Conduct economic impact assessment", "Delay implementation"],
-      "relComments": ["comment1", "comment2", "comment3"]
+    "clusters": [
+        {
+        "clusterName": "Worker Safety Standards",
+        "clusterDescription": "Describes the main theme or focus of this cluster.",
+        "overallSentiment": "Positive",
+        "repOrg": ["Southern Poverty Law Center", "Farmworker Justice"],
+        "recActions": ["Withdraw proposed rule", "Implement safety standards"],
+        "relComments": ["comment1", "comment2", "comment3"]
+        },
+        {
+        "clusterName": "Economic Impact",
+        "clusterDescription": "Describes how new regulations might affect the economy.",
+        "overallSentiment": "Neutral",
+        "repOrg": ["American Farm Bureau Federation"],
+        "recActions": ["Conduct economic impact assessment", "Delay implementation"],
+        "relComments": ["comment1", "comment2", "comment3"]
+        }
+    ]
     }
-  ]
-}
-"""
-
+    """
     # Build a text snippet listing each cluster and sampled comments
     snippet = ""
     for cluster_info in clusters_data:
@@ -109,68 +162,57 @@ def build_prompt(clusters_data):
         for c in sample_comments:
             snippet += f" - {c}\n"
         snippet += "\n"
-
     num_clusters = len(clusters_data)
-
     # Final prompt to the model
     prompt = f"""
-You are an LLM that produces STRICT JSON ONLY, nothing else.
-Your output must match exactly this structure with ALL clusters included.
-
-You have EXACTLY {num_clusters} clusters. You MUST produce the same number of cluster objects. 
-You must NOT merge, combine, or omit any cluster. 
-If the user has 9 clusters, output 9 clusters in the final JSON.
-
-Here is the desired JSON format (an example):
-
-{example_json_structure}
-
-For each cluster, fill in:
-- clusterName
-- clusterDescription (a concise summary of the cluster)
-- overallSentiment: choose "Positive", "Neutral", or "Negative"
-- repOrg: list of representative organizations or stakeholders
-- recActions: recommended actions or changes
-- relComments: a short curated subset of sample comments from that cluster
-
-Below is the data you have:
-
-{snippet}
-
-Return ONLY valid JSON in the final answer. 
-IMPORTANT: You must produce an array of {num_clusters} cluster objects. Do not add extra commentary or text.
-"""
+        You are an LLM that produces STRICT JSON ONLY, nothing else.
+        Your output must match exactly this structure with ALL clusters included.
+        You have EXACTLY {num_clusters} clusters. You MUST produce the same number of cluster objects. 
+        You must NOT merge, combine, or omit any cluster. 
+        If the user has 9 clusters, output 9 clusters in the final JSON.
+        Here is the desired JSON format (an example):
+        {example_json_structure}
+        For each cluster, fill in:
+        - clusterName
+        - clusterDescription (a concise summary of the cluster)
+        - overallSentiment: choose "Positive", "Neutral", or "Negative"
+        - repOrg: list of representative organizations or stakeholders
+        - recActions: recommended actions or changes
+        - relComments: a short curated subset of sample comments from that cluster
+        Below is the data you have:
+        {snippet}
+        Return ONLY valid JSON in the final answer. 
+        IMPORTANT: You must produce an array of {num_clusters} cluster objects. Do not add extra commentary or text.
+        """
     return prompt
 
 def lambda_handler(event, context):
-    """
-    Triggered when a new clustered CSV is uploaded to 'after-clustering/' in S3.
-    1. Download the CSV.
-    2. Group by kmeans_cluster_id and sample up to 5 comments.
-    3. Build a prompt for each cluster.
-    4. Invoke Claude via Bedrock to get a strictly formatted JSON.
-    5. Parse and store the JSON in 'analysis-json/' folder.
-    """
-    logger.info("Event received:")
-    logger.info(json.dumps(event, indent=2))
-
+    """Process clustered results and generate analysis"""
+    document_id = None
     try:
         record = event["Records"][0]
         bucket_name = record["s3"]["bucket"]["name"]
         object_key = record["s3"]["object"]["key"]
+        
+        # Extract document ID
+        document_id = extract_document_id(object_key)
+        if not document_id:
+            raise ValueError(f"Could not extract document ID from key: {object_key}")
+            
+        # Send initial progress update
+        send_progress_update(document_id, 'RUNNING')
+        update_processing_state(document_id, 'RUNNING')
 
-        logger.info(f"New file in S3 => s3://{bucket_name}/{object_key}")
+        logger.info(f"Processing analysis for document {document_id}")
+        logger.info(f"Processing file: s3://{bucket_name}/{object_key}")
 
-        # 1. Download the CSV locally
+        # Download and process CSV
         local_csv_path = f"/tmp/{os.path.basename(object_key)}"
         s3_client.download_file(bucket_name, object_key, local_csv_path)
-
-        # 2. Read CSV, check for required columns
+        
         df = pd.read_csv(local_csv_path)
-        if "kmeans_cluster_id" not in df.columns or "comment_text" not in df.columns:
-            raise ValueError("CSV missing 'kmeans_cluster_id' or 'comment_text' columns.")
-
-        # Group and sample
+        
+        # Group and sample comments for each cluster
         cluster_data_list = []
         grouped = df.groupby("kmeans_cluster_id")
         for cluster_id, grp in grouped:
@@ -183,55 +225,58 @@ def lambda_handler(event, context):
                 "sample_comments": sample_comments
             })
 
-        # 3. Build the prompt
-        prompt_text = build_prompt(cluster_data_list)
-
-        # *** PRINT THE PROMPT TO LOGS FOR DEBUGGING ***
-        logger.info("======== BEDROCK PROMPT START ========")
-        logger.info(prompt_text)
-        logger.info("======== BEDROCK PROMPT END   ========")
-
-        # 4. Invoke Bedrock
-        response_text = invoke_bedrock(prompt_text)
-        logger.info("LLM response received.")
-
-        # 5. Validate JSON
+        # Generate analysis with Bedrock
+        prompt = build_prompt(cluster_data_list)
+        analysis_text = invoke_bedrock(prompt)
+        
         try:
-            final_json = json.loads(response_text)
+            analysis_json = json.loads(analysis_text)
         except json.JSONDecodeError:
-            raise ValueError(f"LLM response is not valid JSON:\n{response_text}")
+            raise ValueError("Failed to parse Bedrock response as JSON")
 
-        # Make sure the LLM returned the same number of clusters we asked for
-        returned_clusters = final_json.get("clusters", [])
-        if len(returned_clusters) != len(cluster_data_list):
-            logger.warning(
-                f"WARNING: Expected {len(cluster_data_list)} clusters but got {len(returned_clusters)}."
-                " The model might have merged or omitted clusters."
-            )
-
-        # Save JSON to 'analysis-json/' folder
-        json_key = f"analysis-json/{os.path.splitext(os.path.basename(object_key))[0]}_analysis.json"
+        # Save analysis JSON
+        json_key = f"analysis-json/comments_{document_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         s3_client.put_object(
             Bucket=bucket_name,
             Key=json_key,
-            Body=json.dumps(final_json, indent=2),
+            Body=json.dumps(analysis_json, indent=2),
             ContentType="application/json"
         )
 
-        logger.info(f"Saved analysis JSON to s3://{bucket_name}/{json_key}")
+        logger.info(f"Analysis complete. Saved to s3://{bucket_name}/{json_key}")
+        
+        # Update state and send final progress update
+        update_processing_state(document_id, 'SUCCEEDED')
+        send_progress_update(document_id, 'SUCCEEDED')
 
         return {
             "statusCode": 200,
             "body": json.dumps({
-                "message": "Cluster analysis completed successfully.",
-                "analysisJsonUri": f"s3://{bucket_name}/{json_key}",
-                "llm_raw_output": response_text  # optional to return raw output
-            })
+                "message": "Analysis completed successfully",
+                "documentId": document_id,
+                "analysisLocation": f"s3://{bucket_name}/{json_key}",
+                "clusters": len(cluster_data_list),
+                "analysisJson": analysis_json  # Include the actual analysis in response
+            }),
+            "headers": {
+                "Content-Type": "application/json"
+            }
         }
 
     except Exception as e:
-        logger.error(f"Error in cluster analysis: {e}")
+        logger.error(f"Error in analysis: {str(e)}", exc_info=True)
+        if document_id:
+            update_processing_state(document_id, 'FAILED', str(e))
+            send_progress_update(document_id, 'FAILED', str(e))
+        
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": str(e)})
+            "body": json.dumps({
+                "error": str(e),
+                "message": "Analysis failed",
+                "documentId": document_id if document_id else "unknown"
+            }),
+            "headers": {
+                "Content-Type": "application/json"
+            }
         }
