@@ -6,11 +6,20 @@ from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 from websocket_utils import create_websocket_service
 
-# Set up logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
+
+def extract_document_id(execution_input: str) -> Optional[str]:
+    """Extract document ID from Step Functions execution input."""
+    logger.info(f"Extracting document ID from input: {execution_input}")
+    try:
+        input_data = json.loads(execution_input)
+        return input_data.get('documentId')
+    except Exception as e:
+        logger.error(f"Error extracting document ID from input: {str(e)}")
+        return None
 
 def map_state_to_progress(status: str, stage: str = 'comment_processing') -> int:
     """Map execution status to progress percentage based on pipeline stage"""
@@ -39,14 +48,23 @@ def map_state_to_progress(status: str, stage: str = 'comment_processing') -> int
     }
     return PROGRESS_MAPS.get(stage, {}).get(status, 0)
 
-def extract_document_id(execution_input: str) -> Optional[str]:
-    print("Extracting document ID from execution input")
+def get_error_details(event: Dict[str, Any], stage: str) -> Optional[str]:
+    """Extract detailed error information from the event"""
     try:
-        input_data = json.loads(execution_input)
-        return input_data.get('documentId')
+        if stage == 'comment_processing':
+            if 'detail' in event and 'cause' in event['detail']:
+                return event['detail']['cause']
+            return "Step Functions execution failed"
+        elif stage == 'clustering':
+            if 'detail' in event and 'FailureReason' in event['detail']:
+                return event['detail']['FailureReason']
+            return "SageMaker processing job failed"
+        elif stage == 'analysis':
+            return event.get('error', "Analysis stage failed")
+        return "Unknown error occurred"
     except Exception as e:
-        print(f"Error extracting document ID from input: {str(e)}")
-        return None
+        logger.error(f"Error extracting error details: {str(e)}")
+        return "Failed to extract error details"
 
 def update_state(state_table, document_id: str, new_state: Dict[str, Any]) -> None:
     """Update state in DynamoDB with preservation of existing values"""
@@ -60,7 +78,11 @@ def update_state(state_table, document_id: str, new_state: Dict[str, Any]) -> No
         
         current_state = json.loads(response['Item']['state']) if 'Item' in response else {}
         
-        # Merge current state with new state
+        # Merge current state with new state, preserving error information
+        if new_state.get('status') in ['FAILED', 'TIMED_OUT', 'ABORTED']:
+            if 'error' not in new_state and 'error' in current_state:
+                new_state['error'] = current_state['error']
+                
         merged_state = {**current_state, **new_state}
         
         state_table.update_item(
@@ -76,6 +98,7 @@ def update_state(state_table, document_id: str, new_state: Dict[str, Any]) -> No
                 ':state': json.dumps(merged_state)
             }
         )
+        logger.info(f"Updated state for document {document_id}: {merged_state}")
     except Exception as e:
         logger.error(f"Error updating state: {str(e)}")
         raise
@@ -96,17 +119,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             status = detail['status']
             document_id = extract_document_id(detail.get('input', '{}'))
             stage = 'comment_processing'
+            logger.info(f"Step Functions state change - Status: {status}, Document: {document_id}")
         elif event_source == 'aws.sagemaker':
             # SageMaker event
             detail = event['detail']
             status = detail['ProcessingJobStatus']
-            document_id = detail['ProcessingJobName'].split('-')[-1]  # Assuming job name contains document ID
+            document_id = detail['ProcessingJobName'].split('-')[-1]
             stage = 'clustering'
+            logger.info(f"SageMaker status change - Status: {status}, Document: {document_id}")
         else:
             # Direct Lambda invocation (analysis stage)
             document_id = event.get('documentId')
             status = event.get('status', 'SUCCEEDED')
             stage = event.get('stage', 'analysis')
+            logger.info(f"Analysis status change - Status: {status}, Document: {document_id}")
             
         if not document_id:
             logger.error("Could not extract document ID from event")
@@ -117,6 +143,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             
         # Calculate progress
         progress = map_state_to_progress(status, stage)
+        logger.info(f"Calculated progress: {progress}% for stage: {stage}, status: {status}")
         
         # Create new state
         new_state = {
@@ -130,18 +157,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             new_state['executionArn'] = execution_arn
             
         if status in ['FAILED', 'TIMED_OUT', 'ABORTED']:
-            new_state['error'] = event.get('detail', {}).get('cause', 'Execution failed')
+            error_details = get_error_details(event, stage)
+            new_state['error'] = error_details
+            logger.error(f"Processing failed in {stage} stage: {error_details}")
         
         # Update state in DynamoDB
         state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
         update_state(state_table, document_id, new_state)
         
-        # Send WebSocket update
+        # Send WebSocket update with enhanced error information
         ws_endpoint = os.environ.get('WEBSOCKET_API_ENDPOINT')
         api_endpoint = os.environ.get('API_GATEWAY_ENDPOINT')
         connections_table = os.environ.get('CONNECTIONS_TABLE_NAME')
-
-        logger.info(f"Creating WebSocket service with endpoint {api_endpoint or ws_endpoint}")
         
         ws_service = create_websocket_service(
             endpoint=api_endpoint or ws_endpoint,
@@ -150,7 +177,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         if ws_service:
             try:
-                ws_service.broadcast_message({
+                message = {
                     'type': 'PROGRESS_UPDATE',
                     'documentId': document_id,
                     'stage': stage,
@@ -158,7 +185,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     'progress': progress,
                     'error': new_state.get('error'),
                     'timestamp': new_state['lastUpdated']
-                })
+                }
+                logger.info(f"Sending WebSocket message: {json.dumps(message)}")
+                ws_service.broadcast_message(message)
             except Exception as e:
                 logger.error(f"Error sending WebSocket update: {str(e)}")
         else:
@@ -169,7 +198,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'documentId': document_id,
             'stage': stage,
             'status': status,
-            'progress': progress
+            'progress': progress,
+            'error': new_state.get('error')
         }
         
     except Exception as e:

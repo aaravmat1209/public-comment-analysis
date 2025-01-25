@@ -15,7 +15,7 @@ class RegulationsAPIClient:
         self.http = urllib3.PoolManager()
 
     def _make_request(self, path: str, params: Dict[str, str]) -> Dict[str, Any]:
-        """Make request to API with retries"""
+        """Make request to API with enhanced error handling"""
         url = f"{self.base_url}{path}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
         print(f"Making request to: {url}")
         
@@ -28,13 +28,19 @@ class RegulationsAPIClient:
             }
         )
         
-        if response.status != 200:
-            raise Exception(f"API request failed with status {response.status}: {response.data}")
+        if response.status == 404:
+            raise urllib3.exceptions.HTTPError("Document not found")
+        elif response.status == 403:
+            raise urllib3.exceptions.HTTPError("API authorization error")
+        elif response.status != 200:
+            raise urllib3.exceptions.HTTPError(
+                f"API request failed with status {response.status}: {response.data.decode('utf-8')}"
+            )
             
         return json.loads(response.data.decode('utf-8'))
 
     def get_document_info(self, document_id: str) -> Dict[str, Any]:
-        """Get document metadata and comment count."""
+        """Get document metadata and comment count with proper error handling."""
         print(f"Fetching document info for: {document_id}")
         
         # Get document object ID
@@ -72,20 +78,21 @@ def initialize_state(
     dynamodb,
     table_name: str,
     document_id: str,
-    document_info: Dict[str, Any]
+    error: str = None
 ) -> Dict[str, Any]:
-    """Initialize processing state in DynamoDB."""
-    total_comments = min(document_info['totalComments'], 100)
+    """Initialize processing state in DynamoDB, with error handling."""
     state = {
         'documentId': document_id,
-        'objectId': document_info['objectId'],
-        'totalComments': total_comments,
-        'processedComments': 0,
-        'lastProcessedPage': 0,
+        'status': 'FAILED' if error else 'INITIALIZED',
+        'progress': 0,
+        'stage': 'comment_processing',
         'startTime': datetime.now(timezone.utc).isoformat(),
-        'status': 'INITIALIZED',
+        'lastUpdated': datetime.now(timezone.utc).isoformat(),
         'ttl': int((datetime.now(timezone.utc).timestamp() + (7 * 24 * 60 * 60)))  # 7 days TTL
     }
+
+    if error:
+        state['error'] = error
     
     try:
         dynamodb.put_item(
@@ -116,18 +123,60 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Initialize API client
         api_client = RegulationsAPIClient(api_key)
         
-        # Get document information and comment count
-        document_info = api_client.get_document_info(document_id)
+        try:
+            # Get document information and comment count
+            document_info = api_client.get_document_info(document_id)
+        except urllib3.exceptions.HTTPError as e:
+            if '404' in str(e):
+                error_msg = f"Document not found: {document_id}"
+            elif '403' in str(e):
+                error_msg = "API authorization error"
+            else:
+                error_msg = f"HTTP error retrieving document: {str(e)}"
+            print(error_msg)
+            
+            # Initialize error state
+            dynamodb = boto3.client('dynamodb')
+            state = initialize_state(
+                dynamodb,
+                os.environ['STATE_TABLE_NAME'],
+                document_id,
+                error=error_msg
+            )
+            
+            return {
+                'statusCode': 404 if '404' in str(e) else 500,
+                'documentId': document_id,
+                'error': error_msg
+            }
+        except Exception as e:
+            error_msg = f"Error retrieving document: {str(e)}"
+            print(error_msg)
+            
+            # Initialize error state
+            dynamodb = boto3.client('dynamodb')
+            state = initialize_state(
+                dynamodb,
+                os.environ['STATE_TABLE_NAME'],
+                document_id,
+                error=error_msg
+            )
+            
+            return {
+                'statusCode': 500,
+                'documentId': document_id,
+                'error': error_msg
+            }
+        
         total_comments = min(document_info['totalComments'], 100)
         print(f"Found {total_comments} comments for document")
         
-        # Initialize state in DynamoDB
+        # Initialize success state in DynamoDB
         dynamodb = boto3.client('dynamodb')
         state = initialize_state(
             dynamodb,
             os.environ['STATE_TABLE_NAME'],
-            document_id,
-            document_info
+            document_id
         )
         
         return {
@@ -138,5 +187,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        print(f"Error in initializer: {str(e)}")
+        error_msg = f"Error in initializer: {str(e)}"
+        print(error_msg)
+        
+        if 'document_id' in locals():
+            # Initialize error state if we have a document ID
+            try:
+                dynamodb = boto3.client('dynamodb')
+                state = initialize_state(
+                    dynamodb,
+                    os.environ['STATE_TABLE_NAME'],
+                    document_id,
+                    error=error_msg
+                )
+            except Exception as state_error:
+                print(f"Error saving error state: {str(state_error)}")
+        
         raise

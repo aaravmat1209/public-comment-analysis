@@ -221,7 +221,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         )
         
         # Optionally cleanup individual files
-        if event.get('cleanupFiles', False):
+        if event.get('cleanupFiles', True):
             for file_info in comments_files + attachments_files:
                 try:
                     s3_client.delete_object(Bucket=bucket, Key=file_info['key'])

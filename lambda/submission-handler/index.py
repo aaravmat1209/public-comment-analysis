@@ -132,7 +132,7 @@ def handle_submission(event: Dict[str, Any]) -> Dict[str, Any]:
         return create_response(500, {'error': 'Internal server error'})
 
 def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle document status check"""
+    """Handle document status check with enhanced error handling"""
     document_id = event['pathParameters']['documentId']
     logger.info(f"Checking status for document: {document_id}")
     
@@ -152,10 +152,18 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
         state = json.loads(response['Item']['state'])
         logger.info(f"Retrieved status for document {document_id}: {state['status']}")
         
+        # Enhance response with error information
         response_body = {
             'documentId': document_id,
-            'status': state
+            'status': state['status'],
+            'stage': state.get('stage', 'unknown'),
+            'progress': state.get('progress', 0),
+            'error': state.get('error'),
+            'lastUpdated': state.get('lastUpdated')
         }
+        
+        # Include full state for debugging
+        response_body['state'] = state
         
         # Get clustering analysis if final stage is complete
         cluster_bucket = os.environ.get('CLUSTERING_BUCKET')
@@ -167,12 +175,25 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
             analysis = get_analysis_json(document_id, cluster_bucket)
             if analysis:
                 response_body['analysis'] = analysis
+            else:
+                response_body['warning'] = 'Analysis results not yet available'
+        
+        # Add failure details if processing failed
+        if state['status'] in ['FAILED', 'TIMED_OUT', 'ABORTED']:
+            response_body['failureDetails'] = {
+                'stage': state.get('stage', 'unknown'),
+                'error': state.get('error', 'Unknown error occurred'),
+                'failureTime': state.get('lastUpdated')
+            }
         
         return create_response(200, response_body)
         
     except Exception as e:
         logger.error(f"Error checking status for document {document_id}", exc_info=True)
-        return create_response(500, {'error': 'Error checking document status'})
+        return create_response(500, {
+            'error': 'Error checking document status',
+            'details': str(e)
+        })
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Handle document submission and status checking"""
