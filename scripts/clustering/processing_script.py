@@ -1,5 +1,6 @@
 import argparse
 import os
+import json
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
@@ -10,9 +11,77 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 
-def process_comments(input_file, output_file, n_clusters=10):
+def clean_comments(df):
+    """Clean comments by removing unwanted entries and tracking duplicates."""
+    logging.info("Starting comment cleaning process...")
+    initial_count = len(df)
+    
+    # Convert comments to string type and lowercase for consistent comparison
+    df['comment_text'] = df['comment_text'].astype(str).str.lower().str.strip()
+    
+    # Track "see attached" comments
+    see_attached_patterns = [
+        'see attached',
+        'see attachment',
+        'please see attached',
+        'please see attachment'
+    ]
+    mask = ~df['comment_text'].str.contains('|'.join(see_attached_patterns), case=False)
+    see_attached_comments = df[~mask].copy()
+    df = df[mask]
+    
+    # Track duplicate comments
+    duplicate_groups = []
+    for _, group in df.groupby('comment_text'):
+        if len(group) > 1:
+            duplicate_groups.append({
+                'comment_text': group['comment_text'].iloc[0],
+                'count': len(group),
+                'comment_ids': group['comment_id'].tolist()
+            })
+    
+    # Remove exact duplicates based on comment text, keeping first occurrence
+    df = df.drop_duplicates(subset=['comment_text'])
+    
+    final_count = len(df)
+    removed_count = initial_count - final_count
+    
+    # Create metadata about cleaning
+    cleaning_metadata = {
+        'initial_count': initial_count,
+        'final_count': final_count,
+        'removed_count': removed_count,
+        'see_attached_count': len(see_attached_comments),
+        'see_attached_comments': see_attached_comments[['comment_id', 'comment_text']].to_dict('records') if 'comment_id' in see_attached_comments.columns else [],
+        'duplicate_groups': duplicate_groups
+    }
+    
+    logging.info(f"Removed {removed_count} comments:")
+    logging.info(f" - Initial count: {initial_count}")
+    logging.info(f" - Final count: {final_count}")
+    logging.info(f" - See attached comments: {len(see_attached_comments)}")
+    logging.info(f" - Duplicate groups: {len(duplicate_groups)}")
+    
+    return df, cleaning_metadata
+
+def process_comments(input_file, output_file, metadata_file, n_clusters=10):
+    """Process comments including cleaning, clustering, and metadata tracking."""
     logging.info("Reading input file...")
     df = pd.read_csv(input_file)
+
+    # Clean comments before clustering
+    logging.info("Cleaning comments...")
+    df, cleaning_metadata = clean_comments(df)
+    
+    # Save cleaning metadata
+    logging.info(f"Saving cleaning metadata to {metadata_file}")
+    os.makedirs(os.path.dirname(metadata_file), exist_ok=True)
+    with open(metadata_file, 'w') as f:
+        json.dump(cleaning_metadata, f, indent=2)
+    
+    if len(df) == 0:
+        logging.error("No valid comments remaining after cleaning!")
+        raise ValueError("No valid comments to cluster")
 
     # Extract comments
     logging.info("Extracting comments...")
@@ -30,6 +99,10 @@ def process_comments(input_file, output_file, n_clusters=10):
     logging.info("Normalizing embeddings...")
     scaler = StandardScaler()
     embeddings_scaled = scaler.fit_transform(embeddings)
+
+    # Adjust number of clusters if necessary
+    n_clusters = min(n_clusters, len(df))
+    logging.info(f"Using {n_clusters} clusters for {len(df)} comments")
 
     # Apply KMeans clustering
     logging.info("Applying KMeans clustering...")
@@ -56,26 +129,29 @@ def main(input_data, output_data, object_name, n_clusters):
     input_file = os.path.join(input_data, object_name)
     logging.info(f"Processing input file: {input_file}")
 
-    # Extract document ID from input filename (format: comments_DOCUMENT-ID_timestamp.csv)
+    # Extract document ID from input filename
     try:
-        # Updated to handle both possible input formats
         if 'comments_' in object_name:
             doc_id = object_name.split('comments_')[1].split('_')[0]
         else:
-            # Fallback to directory structure if filename doesn't contain ID
             doc_id = os.path.dirname(input_file).split('/')[-2]
         logging.info(f"Extracted document ID: {doc_id}")
     except Exception as e:
         logging.error(f"Error extracting document ID from {object_name}: {str(e)}")
         raise
 
-    # Create output filename with document ID
+    # Create output paths
     output_filename = f'clustered_results_{doc_id}.csv'
+    metadata_filename = f'metadata_{doc_id}.json'
+    
     output_path = os.path.join(output_data, output_filename)
+    metadata_path = os.path.join(output_data, metadata_filename)
+    
     logging.info(f"Will save clustered results to: {output_path}")
+    logging.info(f"Will save metadata to: {metadata_path}")
 
     # Process the comments
-    process_comments(input_file, output_path, n_clusters=n_clusters)
+    process_comments(input_file, output_path, metadata_path, n_clusters=n_clusters)
     logging.info(f"Successfully saved clustered results as {output_filename}")
 
 if __name__ == "__main__":

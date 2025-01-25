@@ -195,6 +195,27 @@ def build_prompt(clusters_data):
         """
     return prompt
 
+def get_cleaning_metadata(s3_client, bucket: str, document_id: str):
+    """Retrieve cleaning metadata for the document."""
+    try:
+        # Look for cleaning metadata file
+        response = s3_client.list_objects_v2(
+            Bucket=bucket,
+            Prefix=f"after-clustering/metadata_{document_id}"
+        )
+        
+        if 'Contents' in response:
+            # Get the latest metadata file
+            latest_file = max(response['Contents'], key=lambda x: x['LastModified'])
+            file_content = s3_client.get_object(
+                Bucket=bucket,
+                Key=latest_file['Key']
+            )
+            return json.loads(file_content['Body'].read().decode('utf-8'))
+    except Exception as e:
+        logger.warning(f"Error retrieving cleaning metadata: {str(e)}")
+    return None
+
 def lambda_handler(event, context):
     """Process clustered results and generate analysis"""
     try:
@@ -216,7 +237,6 @@ def lambda_handler(event, context):
         update_processing_state(document_id, 'RUNNING')
 
         logger.info(f"Processing analysis for document {document_id}")
-        logger.info(f"Processing file: s3://{bucket_name}/{object_key}")
 
         # Download and process CSV
         local_csv_path = f"/tmp/{os.path.basename(object_key)}"
@@ -246,6 +266,11 @@ def lambda_handler(event, context):
         except json.JSONDecodeError:
             raise ValueError("Failed to parse Bedrock response as JSON")
 
+        # Get cleaning metadata
+        cleaning_metadata = get_cleaning_metadata(s3_client, bucket_name, document_id)
+        if cleaning_metadata:
+            analysis_json['cleaning_metadata'] = cleaning_metadata
+
         # Save analysis JSON
         json_key = f"analysis-json/comments_{document_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         s3_client.put_object(
@@ -268,7 +293,7 @@ def lambda_handler(event, context):
                 "documentId": document_id,
                 "analysisLocation": f"s3://{bucket_name}/{json_key}",
                 "clusters": len(cluster_data_list),
-                "analysisJson": analysis_json  # Include the actual analysis in response
+                "analysisJson": analysis_json
             }),
             "headers": {
                 "Content-Type": "application/json"
