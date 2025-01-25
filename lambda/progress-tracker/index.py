@@ -12,16 +12,32 @@ logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
 
-def map_state_to_progress(status: str, previous_status: str = None) -> int:
-    """Map Step Functions execution status to progress percentage"""
-    PROGRESS_MAP = {
-        'RUNNING': 50,
-        'SUCCEEDED': 100,
-        'FAILED': 100,
-        'TIMED_OUT': 100,
-        'ABORTED': 100
+def map_state_to_progress(status: str, stage: str = 'comment_processing') -> int:
+    """Map execution status to progress percentage based on pipeline stage"""
+    PROGRESS_MAPS = {
+        'comment_processing': {
+            'RUNNING': 50,
+            'SUCCEEDED': 75,
+            'FAILED': 75,
+            'TIMED_OUT': 75,
+            'ABORTED': 75
+        },
+        'clustering': {
+            'RUNNING': 80,
+            'SUCCEEDED': 85,
+            'FAILED': 85,
+            'TIMED_OUT': 85,
+            'ABORTED': 85
+        },
+        'analysis': {
+            'RUNNING': 90,
+            'SUCCEEDED': 100,
+            'FAILED': 100,
+            'TIMED_OUT': 100,
+            'ABORTED': 100
+        }
     }
-    return PROGRESS_MAP.get(status, 0)
+    return PROGRESS_MAPS.get(stage, {}).get(status, 0)
 
 def extract_document_id(execution_input: str) -> Optional[str]:
     print("Extracting document ID from execution input")
@@ -32,36 +48,9 @@ def extract_document_id(execution_input: str) -> Optional[str]:
         print(f"Error extracting document ID from input: {str(e)}")
         return None
 
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Handle Step Functions execution status change events"""
+def update_state(state_table, document_id: str, new_state: Dict[str, Any]) -> None:
+    """Update state in DynamoDB with preservation of existing values"""
     try:
-        logger.info(f"Received event: {json.dumps(event)}")
-        
-        detail = event['detail']
-        execution_arn = detail['executionArn']
-        status = detail['status']
-        
-        # Get document ID
-        document_id = extract_document_id(detail.get('input', '{}'))
-        logger.info(f"Received Document ID: [{document_id}]")
-        if not document_id:
-            logger.error("Could not extract document ID from execution input")
-            return {
-                'statusCode': 400,
-                'error': 'Missing document ID in execution input'
-            }
-            
-        # Get state table name
-        state_table_name = os.environ.get('STATE_TABLE_NAME')
-        if not state_table_name:
-            logger.error("STATE_TABLE_NAME environment variable not set")
-            return {
-                'statusCode': 500,
-                'error': 'Missing STATE_TABLE_NAME environment variable'
-            }
-            
-        logger.info(f"Getting current state from DynamoDB table {state_table_name}")
-        state_table = dynamodb.Table(state_table_name)
         response = state_table.get_item(
             Key={
                 'documentId': document_id,
@@ -70,23 +59,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         )
         
         current_state = json.loads(response['Item']['state']) if 'Item' in response else {}
-        previous_status = current_state.get('status')
         
-        # Calculate progress
-        progress = map_state_to_progress(status, previous_status)
+        # Merge current state with new state
+        merged_state = {**current_state, **new_state}
         
-        # Create new state
-        new_state = {
-            'status': status,
-            'progress': progress,
-            'executionArn': execution_arn,
-            'lastUpdated': datetime.now(timezone.utc).isoformat()
-        }
-        
-        if status in ['FAILED', 'TIMED_OUT', 'ABORTED']:
-            new_state['error'] = detail.get('cause', 'Execution failed')
-            
-        logger.info(f"Updating state in DynamoDB...")
         state_table.update_item(
             Key={
                 'documentId': document_id,
@@ -97,13 +73,70 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 '#state': 'state'
             },
             ExpressionAttributeValues={
-                ':state': json.dumps(new_state)
+                ':state': json.dumps(merged_state)
             }
         )
+    except Exception as e:
+        logger.error(f"Error updating state: {str(e)}")
+        raise
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """Handle state changes from Step Functions, SageMaker, and Lambda events"""
+    try:
+        logger.info(f"Received event: {json.dumps(event)}")
         
-        logger.info("Sending WebSocket update...")
+        # Determine event type and extract relevant information
+        event_source = event.get('source', '')
+        stage = 'comment_processing'  # Default stage
         
-        # Try to send WebSocket update with API Gateway endpoint
+        if event_source == 'aws.states':
+            # Step Functions event
+            detail = event['detail']
+            execution_arn = detail['executionArn']
+            status = detail['status']
+            document_id = extract_document_id(detail.get('input', '{}'))
+            stage = 'comment_processing'
+        elif event_source == 'aws.sagemaker':
+            # SageMaker event
+            detail = event['detail']
+            status = detail['ProcessingJobStatus']
+            document_id = detail['ProcessingJobName'].split('-')[-1]  # Assuming job name contains document ID
+            stage = 'clustering'
+        else:
+            # Direct Lambda invocation (analysis stage)
+            document_id = event.get('documentId')
+            status = event.get('status', 'SUCCEEDED')
+            stage = event.get('stage', 'analysis')
+            
+        if not document_id:
+            logger.error("Could not extract document ID from event")
+            return {
+                'statusCode': 400,
+                'error': 'Missing document ID'
+            }
+            
+        # Calculate progress
+        progress = map_state_to_progress(status, stage)
+        
+        # Create new state
+        new_state = {
+            'status': status,
+            'progress': progress,
+            'stage': stage,
+            'lastUpdated': datetime.now(timezone.utc).isoformat()
+        }
+        
+        if stage == 'comment_processing':
+            new_state['executionArn'] = execution_arn
+            
+        if status in ['FAILED', 'TIMED_OUT', 'ABORTED']:
+            new_state['error'] = event.get('detail', {}).get('cause', 'Execution failed')
+        
+        # Update state in DynamoDB
+        state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
+        update_state(state_table, document_id, new_state)
+        
+        # Send WebSocket update
         ws_endpoint = os.environ.get('WEBSOCKET_API_ENDPOINT')
         api_endpoint = os.environ.get('API_GATEWAY_ENDPOINT')
         connections_table = os.environ.get('CONNECTIONS_TABLE_NAME')
@@ -114,12 +147,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             endpoint=api_endpoint or ws_endpoint,
             connections_table_name=connections_table
         )
+        
         if ws_service:
             try:
                 ws_service.broadcast_message({
                     'type': 'PROGRESS_UPDATE',
                     'documentId': document_id,
-                    'executionArn': execution_arn,
+                    'stage': stage,
                     'status': status,
                     'progress': progress,
                     'error': new_state.get('error'),
@@ -133,13 +167,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return {
             'statusCode': 200,
             'documentId': document_id,
+            'stage': stage,
             'status': status,
-            'executionArn': execution_arn,
             'progress': progress
         }
         
     except Exception as e:
-        logger.error(f"Error handling execution status change: {str(e)}", exc_info=True)
+        logger.error(f"Error handling state change: {str(e)}", exc_info=True)
         return {
             'statusCode': 500,
             'error': str(e)

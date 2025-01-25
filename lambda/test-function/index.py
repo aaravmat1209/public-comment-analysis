@@ -5,13 +5,13 @@ import urllib3
 import websocket
 import threading
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Test the document processing backend"""
     try:
         # Configuration
-        api_endpoint = os.environ['API_ENDPOINT']
+        api_endpoint = os.environ['API_ENDPOINT'].rstrip('/')  # Remove trailing slash if present
         websocket_endpoint = os.environ['WEBSOCKET_ENDPOINT']
         
         # Test document IDs
@@ -19,6 +19,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         # Dictionary to store progress updates
         progress_updates = {}
+        final_analysis = {}
         
         # WebSocket message handler
         def on_message(ws, message):
@@ -28,10 +29,37 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     doc_id = data['documentId']
                     progress_updates[doc_id] = {
                         'status': data['status'],
+                        'stage': data.get('stage', 'unknown'),
                         'progress': data.get('progress', 0),
                         'timestamp': data['timestamp']
                     }
                     print(f"Progress update for {doc_id}: {progress_updates[doc_id]}")
+                    
+                    # If progress is 100%, get the analysis results
+                    if data.get('progress') == 100:
+                        try:
+                            print(f"Processing complete for {doc_id}, fetching analysis...")
+                            http = urllib3.PoolManager()
+                            response = http.request(
+                                'GET',
+                                f"{api_endpoint}/documents/{doc_id}",
+                                headers={
+                                    'Content-Type': 'application/json'
+                                }
+                            )
+                            
+                            if response.status == 200:
+                                result = json.loads(response.data.decode('utf-8'))
+                                final_analysis[doc_id] = result.get('analysis')
+                                print(f"Analysis retrieved for {doc_id}")
+                                print(json.dumps(final_analysis[doc_id], indent=2))
+                            else:
+                                print(f"Error getting analysis: {response.status}")
+                                print(response.data.decode('utf-8'))
+                                
+                        except Exception as e:
+                            print(f"Error fetching analysis: {str(e)}")
+                    
             except Exception as e:
                 print(f"Error processing message: {str(e)}")
                 print(f"Message content: {message}")
@@ -66,6 +94,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         http = urllib3.PoolManager()
         
         # Submit documents for processing
+        print(f"Submitting documents to {api_endpoint}/documents")
         response = http.request(
             'POST',
             f"{api_endpoint}/documents",
@@ -77,7 +106,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             }).encode('utf-8')
         )
         
-        print(f"RESPONSE FROM POST: {response}")
+        print(f"POST Response Status: {response.status}")
+        print(f"POST Response Body: {response.data.decode('utf-8')}")
         
         if response.status != 200:
             raise Exception(f"Failed to submit documents: {response.data.decode('utf-8')}")
@@ -85,24 +115,33 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         submission_result = json.loads(response.data.decode('utf-8'))
         print(f"Submission result: {json.dumps(submission_result, indent=2)}")
         
-        # Monitor progress for 5 minutes
+        # Monitor progress for up to 15 minutes
         start_time = time.time()
-        timeout = 300  # 5 minutes
+        timeout = 900  # 15 minutes
+        check_interval = 10  # seconds between checks
         
         while time.time() - start_time < timeout:
             # Check if all documents are completed
             all_completed = True
             for doc_id in document_ids:
-                if doc_id not in progress_updates or progress_updates[doc_id]['progress'] < 100:
+                if (doc_id not in progress_updates or 
+                    progress_updates[doc_id]['progress'] < 100 or
+                    doc_id not in final_analysis):
                     all_completed = False
                     break
             
             if all_completed:
                 print("All documents processed successfully!")
+                print("\nFinal Analysis Results:")
+                for doc_id in document_ids:
+                    print(f"\nDocument {doc_id}:")
+                    print(json.dumps(final_analysis[doc_id], indent=2))
                 break
             
-            # Wait a bit before checking again
-            time.sleep(5)
+            # Wait before checking again
+            time.sleep(check_interval)
+        else:
+            print("Timeout waiting for processing to complete")
         
         # Close WebSocket connection
         ws.close()
@@ -113,7 +152,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'body': json.dumps({
                 'message': 'Test completed',
                 'submissionResult': submission_result,
-                'finalProgress': progress_updates
+                'finalProgress': progress_updates,
+                'analysisResults': final_analysis
             }, indent=2)
         }
         
