@@ -78,11 +78,13 @@ def initialize_state(
     dynamodb,
     table_name: str,
     document_id: str,
+    document_title: str = None,
     error: str = None
 ) -> Dict[str, Any]:
     """Initialize processing state in DynamoDB, with error handling."""
     state = {
         'documentId': document_id,
+        'documentTitle': document_title,
         'status': 'FAILED' if error else 'INITIALIZED',
         'progress': 0,
         'stage': 'comment_processing',
@@ -141,6 +143,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 dynamodb,
                 os.environ['STATE_TABLE_NAME'],
                 document_id,
+                document_title=None,
                 error=error_msg
             )
             
@@ -159,6 +162,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 dynamodb,
                 os.environ['STATE_TABLE_NAME'],
                 document_id,
+                document_title=None,
                 error=error_msg
             )
             
@@ -169,21 +173,26 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             }
         
         total_comments = min(document_info['totalComments'], 100)
-        print(f"Found {total_comments} comments for document")
+        
+        # Get document title from the API response
+        document_title = document_info['document']['attributes'].get('title', '')
+        print(f"Found {total_comments} comments for document with title {document_title}")
         
         # Initialize success state in DynamoDB
         dynamodb = boto3.client('dynamodb')
         state = initialize_state(
             dynamodb,
             os.environ['STATE_TABLE_NAME'],
-            document_id
+            document_id,
+            document_title=document_title
         )
-        
+
         return {
             'documentId': document_id,
             'objectId': document_info['objectId'],
             'totalComments': total_comments,
-            'startTime': state['startTime']
+            'startTime': state['startTime'],
+            'documentTitle': document_title
         }
 
     except Exception as e:
@@ -198,6 +207,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     dynamodb,
                     os.environ['STATE_TABLE_NAME'],
                     document_id,
+                    document_title=None,
                     error=error_msg
                 )
             except Exception as state_error:

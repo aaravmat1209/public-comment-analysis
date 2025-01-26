@@ -152,9 +152,9 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
         state = json.loads(response['Item']['state'])
         logger.info(f"Retrieved status for document {document_id}: {state['status']}")
         
-        # Enhance response with error information
         response_body = {
             'documentId': document_id,
+            'documentTitle': state.get('documentTitle', ''),
             'status': state['status'],
             'stage': state.get('stage', 'unknown'),
             'progress': state.get('progress', 0),

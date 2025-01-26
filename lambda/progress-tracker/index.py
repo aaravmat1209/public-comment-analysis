@@ -2,13 +2,15 @@ import json
 import os
 import boto3
 import logging
-from typing import Dict, Any, Optional
 from datetime import datetime, timezone
+from typing import Dict, Any, Optional
 from websocket_utils import create_websocket_service
 
+# Set up logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Initialize AWS clients
 dynamodb = boto3.resource('dynamodb')
 
 def extract_document_id(execution_input: str) -> Optional[str]:
@@ -66,8 +68,8 @@ def get_error_details(event: Dict[str, Any], stage: str) -> Optional[str]:
         logger.error(f"Error extracting error details: {str(e)}")
         return "Failed to extract error details"
 
-def update_state(state_table, document_id: str, new_state: Dict[str, Any]) -> None:
-    """Update state in DynamoDB with preservation of existing values"""
+def get_current_state(state_table, document_id: str) -> Dict[str, Any]:
+    """Get current state from DynamoDB including documentTitle."""
     try:
         response = state_table.get_item(
             Key={
@@ -76,14 +78,32 @@ def update_state(state_table, document_id: str, new_state: Dict[str, Any]) -> No
             }
         )
         
-        current_state = json.loads(response['Item']['state']) if 'Item' in response else {}
+        if 'Item' in response:
+            return json.loads(response['Item']['state'])
+        return {}
         
+    except Exception as e:
+        logger.error(f"Error getting current state: {str(e)}")
+        return {}
+
+def update_state(state_table, document_id: str, new_state: Dict[str, Any]) -> None:
+    """Update state in DynamoDB with preservation of existing values"""
+    try:
+        # Get current state to preserve documentTitle and other fields
+        current_state = get_current_state(state_table, document_id)
+        logger.info(f"Current state: {json.dumps(current_state)}")
+        
+        # Preserve documentTitle from current state if it exists
+        if 'documentTitle' in current_state and 'documentTitle' not in new_state:
+            new_state['documentTitle'] = current_state['documentTitle']
+            
         # Merge current state with new state, preserving error information
         if new_state.get('status') in ['FAILED', 'TIMED_OUT', 'ABORTED']:
             if 'error' not in new_state and 'error' in current_state:
                 new_state['error'] = current_state['error']
                 
         merged_state = {**current_state, **new_state}
+        logger.info(f"Merged state: {json.dumps(merged_state)}")
         
         state_table.update_item(
             Key={
@@ -99,6 +119,7 @@ def update_state(state_table, document_id: str, new_state: Dict[str, Any]) -> No
             }
         )
         logger.info(f"Updated state for document {document_id}: {merged_state}")
+        
     except Exception as e:
         logger.error(f"Error updating state: {str(e)}")
         raise
@@ -145,6 +166,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         progress = map_state_to_progress(status, stage)
         logger.info(f"Calculated progress: {progress}% for stage: {stage}, status: {status}")
         
+        # Get current state to retrieve documentTitle
+        state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
+        current_state = get_current_state(state_table, document_id)
+        
         # Create new state
         new_state = {
             'status': status,
@@ -156,13 +181,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if stage == 'comment_processing':
             new_state['executionArn'] = execution_arn
             
+        # Preserve documentTitle if it exists
+        if 'documentTitle' in current_state:
+            new_state['documentTitle'] = current_state['documentTitle']
+            
         if status in ['FAILED', 'TIMED_OUT', 'ABORTED']:
             error_details = get_error_details(event, stage)
             new_state['error'] = error_details
             logger.error(f"Processing failed in {stage} stage: {error_details}")
         
         # Update state in DynamoDB
-        state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
         update_state(state_table, document_id, new_state)
         
         # Send WebSocket update with enhanced error information
@@ -183,6 +211,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     'stage': stage,
                     'status': status,
                     'progress': progress,
+                    'documentTitle': new_state.get('documentTitle', ''),
                     'error': new_state.get('error'),
                     'timestamp': new_state['lastUpdated']
                 }
@@ -199,6 +228,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'stage': stage,
             'status': status,
             'progress': progress,
+            'documentTitle': new_state.get('documentTitle', ''),
             'error': new_state.get('error')
         }
         
