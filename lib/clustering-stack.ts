@@ -274,8 +274,16 @@ export class ClusteringStack extends cdk.Stack {
     this.clusteringBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
       new s3n.LambdaDestination(processingLambda),
-      { prefix: 'before-clustering/' }
+      { 
+        prefix: 'before-clustering/',
+        suffix: '.csv'
+      }
     );
+
+    // Add environment variables for processing
+    processingLambda.addEnvironment('CLUSTERING_BUCKET', this.clusteringBucketName);
+    processingLambda.addEnvironment('INPUT_PREFIX', 'before-clustering');
+    processingLambda.addEnvironment('OUTPUT_PREFIX', 'after-clustering');
 
     // Trigger analysis Lambda when files are added to after-clustering/
     this.clusteringBucket.addEventNotification(

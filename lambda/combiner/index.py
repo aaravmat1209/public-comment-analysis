@@ -135,6 +135,56 @@ def aggregate_metadata(
     
     return metadata
 
+def create_empty_attachments_file(s3_client, clustering_bucket: str, document_id: str, timestamp: str) -> str:
+    """Create an empty attachments CSV file with headers."""
+    print(f"Creating empty attachments file for document {document_id}")
+    
+    # Create empty CSV with headers
+    headers = [
+        'comment_id', 'document_id', 'attachment_id', 'doc_order',
+        'title', 'modify_date', 'file_format', 'file_url', 'size'
+    ]
+    empty_csv = StringIO()
+    writer = csv.writer(empty_csv)
+    writer.writerow(headers)
+    
+    # Save to S3
+    attachments_key = f"before-clustering/{document_id}/attachments_{document_id}_{timestamp}.csv"
+    s3_client.put_object(
+        Bucket=clustering_bucket,
+        Key=attachments_key,
+        Body=empty_csv.getvalue().encode('utf-8'),
+        ContentType='text/csv'
+    )
+    
+    print(f"Created empty attachments file: {attachments_key}")
+    return attachments_key
+
+def clean_directory(s3_client, bucket: str, prefix: str) -> None:
+    """Delete all files in the specified directory prefix."""
+    print(f"Cleaning up directory: {prefix}")
+    try:
+        # List all objects in the directory
+        paginator = s3_client.get_paginator('list_objects_v2')
+        
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            if 'Contents' in page:
+                # Delete all objects in this page
+                objects_to_delete = [{'Key': obj['Key']} for obj in page['Contents']]
+                if objects_to_delete:
+                    s3_client.delete_objects(
+                        Bucket=bucket,
+                        Delete={
+                            'Objects': objects_to_delete,
+                            'Quiet': True
+                        }
+                    )
+                    print(f"Deleted {len(objects_to_delete)} objects from {prefix}")
+                    
+    except Exception as e:
+        print(f"Error cleaning directory {prefix}: {str(e)}")
+        # Continue processing even if cleanup fails
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Combine processed comment and attachment files into consolidated files."""
     try:
@@ -146,6 +196,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         s3_client = boto3.client('s3')
         bucket = os.environ['OUTPUT_S3_BUCKET']
+        
+        # Clean up the final directory before processing
+        final_directory = f"{document_id}/final/"
+        clean_directory(s3_client, bucket, final_directory)
         
         # Get all comments and attachments files
         comments_files = get_content_files(s3_client, bucket, document_id, "comments")
@@ -176,8 +230,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         print(f"Copying to clustering bucket {clustering_bucket}")
         if clustering_bucket:
             try:
+                # Clean up existing files in clustering bucket
+                clean_directory(s3_client, clustering_bucket, f"before-clustering/{document_id}/")
+                
                 # Copy to before-clustering folder in clustering bucket
-                clustering_key = f"before-clustering/comments_{document_id}_{timestamp}.csv"
+                clustering_key = f"before-clustering/{document_id}/comments_{document_id}_{timestamp}.csv"
                 
                 # Copy the combined CSV to the clustering bucket
                 s3_client.copy_object(
@@ -188,6 +245,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 
                 print(f"Copied combined CSV to s3://{clustering_bucket}/{clustering_key}")
                 final_files['clustering'] = f"s3://{clustering_bucket}/{clustering_key}"
+                
+                # If no attachments exist, create an empty attachments file
+                if not attachments_files:
+                    print("No attachments found, creating empty attachments file")
+                    attachments_key = create_empty_attachments_file(
+                        s3_client,
+                        clustering_bucket,
+                        document_id,
+                        timestamp
+                    )
+                    final_files['clustering_attachments'] = f"s3://{clustering_bucket}/{attachments_key}"
+                
             except Exception as e:
                 print(f"Error copying to clustering bucket: {str(e)}")
                 # Continue processing even if clustering copy fails
@@ -205,6 +274,23 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 ContentType='text/csv'
             )
             final_files['attachments'] = final_attachments_key
+            print(f"Copying to clustering bucket {clustering_bucket}")
+            if clustering_bucket:
+                try:
+                    # Copy to before-clustering folder in clustering bucket
+                    attachments_key = f"before-clustering/{document_id}/attachments_{document_id}_{timestamp}.csv"
+                    
+                    # Copy the combined CSV to the clustering bucket
+                    s3_client.copy_object(
+                        Bucket=clustering_bucket,
+                        Key=attachments_key,
+                        CopySource={'Bucket': bucket, 'Key': final_attachments_key}
+                    )
+                    
+                    print(f"Copied combined CSV to s3://{clustering_bucket}/{attachments_key}")
+                    final_files['clustering_attachments'] = f"s3://{clustering_bucket}/{attachments_key}"
+                except Exception as e:
+                    print(f"Error copying to clustering bucket: {str(e)}")
         
         # Aggregate metadata
         metadata = aggregate_metadata(s3_client, bucket, document_id)
@@ -229,14 +315,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     print(f"Error deleting file {file_info['key']}: {str(e)}")
             
             # Clean up metadata files
-            paginator = s3_client.get_paginator('list_objects_v2')
-            for page in paginator.paginate(Bucket=bucket, Prefix=f"{document_id}/metadata/"):
-                if 'Contents' in page:
-                    for obj in page['Contents']:
-                        try:
-                            s3_client.delete_object(Bucket=bucket, Key=obj['Key'])
-                        except Exception as e:
-                            print(f"Error deleting metadata file {obj['Key']}: {str(e)}")
+            clean_directory(s3_client, bucket, f"{document_id}/metadata/")
         
         return {
             'documentId': document_id,

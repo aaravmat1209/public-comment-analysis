@@ -7,10 +7,10 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import { Construct } from 'constructs';
 
 interface RestApiStackProps extends cdk.StackProps {
-  stateMachine: sfn.StateMachine;
-  stateTable: dynamodb.Table;
-  webSocketEndpoint: string;
-  clusteringBucketName: string;  // Added clustering bucket name
+    stateMachine: sfn.StateMachine;
+    stateTable: dynamodb.Table;
+    webSocketEndpoint: string;
+    clusteringBucketName: string;
 }
 
 export class RestApiStack extends cdk.Stack {
@@ -27,11 +27,69 @@ export class RestApiStack extends cdk.Stack {
                 tracingEnabled: true,
             },
             defaultCorsPreflightOptions: {
-                allowOrigins: apigateway.Cors.ALL_ORIGINS,
-                allowMethods: apigateway.Cors.ALL_METHODS,
-                allowHeaders: ['Content-Type', 'Authorization'],
+                allowOrigins: ['*'],
+                allowMethods: ['GET', 'POST', 'OPTIONS'],
+                allowHeaders: [
+                    'Content-Type',
+                    'Authorization',
+                    'X-Amz-Date',
+                    'X-Api-Key',
+                    'X-Amz-Security-Token'
+                ],
+                maxAge: cdk.Duration.seconds(300)
             }
         });
+
+        // Add Gateway Responses for all error types
+        const corsHeaders = {
+            'Access-Control-Allow-Origin': "'*'",
+            'Access-Control-Allow-Headers': "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'",
+            'Access-Control-Allow-Methods': "'GET,POST,OPTIONS'"
+        };
+
+        // Add responses for all relevant gateway error types
+        const gatewayResponses: { [key: string]: apigateway.GatewayResponse } = {
+            UNAUTHORIZED: new apigateway.GatewayResponse(this, 'Unauthorized', {
+                restApi: api,
+                type: apigateway.ResponseType.UNAUTHORIZED,
+                responseHeaders: corsHeaders
+            }),
+            ACCESS_DENIED: new apigateway.GatewayResponse(this, 'AccessDenied', {
+                restApi: api,
+                type: apigateway.ResponseType.ACCESS_DENIED,
+                responseHeaders: corsHeaders
+            }),
+            RESOURCE_NOT_FOUND: new apigateway.GatewayResponse(this, 'ResourceNotFound', {
+                restApi: api,
+                type: apigateway.ResponseType.RESOURCE_NOT_FOUND,
+                responseHeaders: corsHeaders
+            }),
+            INVALID_API_KEY: new apigateway.GatewayResponse(this, 'InvalidApiKey', {
+                restApi: api,
+                type: apigateway.ResponseType.INVALID_API_KEY,
+                responseHeaders: corsHeaders
+            }),
+            REQUEST_TOO_LARGE: new apigateway.GatewayResponse(this, 'RequestTooLarge', {
+                restApi: api,
+                type: apigateway.ResponseType.REQUEST_TOO_LARGE,
+                responseHeaders: corsHeaders
+            }),
+            THROTTLED: new apigateway.GatewayResponse(this, 'Throttled', {
+                restApi: api,
+                type: apigateway.ResponseType.THROTTLED,
+                responseHeaders: corsHeaders
+            }),
+            DEFAULT_4XX: new apigateway.GatewayResponse(this, 'Default4XX', {
+                restApi: api,
+                type: apigateway.ResponseType.DEFAULT_4XX,
+                responseHeaders: corsHeaders
+            }),
+            DEFAULT_5XX: new apigateway.GatewayResponse(this, 'Default5XX', {
+                restApi: api,
+                type: apigateway.ResponseType.DEFAULT_5XX,
+                responseHeaders: corsHeaders
+            })
+        };
         
         this.apiUrl = api.url;
 
@@ -44,38 +102,40 @@ export class RestApiStack extends cdk.Stack {
                 STATE_MACHINE_ARN: props.stateMachine.stateMachineArn,
                 STATE_TABLE_NAME: props.stateTable.tableName,
                 WEBSOCKET_API_ENDPOINT: props.webSocketEndpoint,
-                CLUSTERING_BUCKET: props.clusteringBucketName,  // Added clustering bucket env var
+                CLUSTERING_BUCKET: props.clusteringBucketName,
             },
             timeout: cdk.Duration.minutes(1),
         });
 
-        // Grant permissions to access clustering bucket
-        const clusteringBucketPolicy = new iam.PolicyStatement({
-            effect: iam.Effect.ALLOW,
-            actions: [
-                's3:GetObject',
-                's3:ListBucket'
-            ],
-            resources: [
-                `arn:aws:s3:::${props.clusteringBucketName}`,
-                `arn:aws:s3:::${props.clusteringBucketName}/*`
-            ]
-        });
-        submissionHandler.addToRolePolicy(clusteringBucketPolicy);
-
-        // Grant permissions to start state machine executions
+        // Grant permissions
         props.stateMachine.grantStartExecution(submissionHandler);
         props.stateTable.grantReadWriteData(submissionHandler);
+
+        if (props.clusteringBucketName) {
+            const clusteringBucketPolicy = new iam.PolicyStatement({
+                effect: iam.Effect.ALLOW,
+                actions: ['s3:GetObject', 's3:ListBucket'],
+                resources: [
+                    `arn:aws:s3:::${props.clusteringBucketName}`,
+                    `arn:aws:s3:::${props.clusteringBucketName}/*`
+                ]
+            });
+            submissionHandler.addToRolePolicy(clusteringBucketPolicy);
+        }
 
         // Create API endpoints
         const documents = api.root.addResource('documents');
         
-        // POST /documents - Submit new documents for processing
-        documents.addMethod('POST', new apigateway.LambdaIntegration(submissionHandler));
+        // POST /documents
+        documents.addMethod('POST', new apigateway.LambdaIntegration(submissionHandler, {
+            proxy: true
+        }));
         
-        // GET /documents/{documentId} - Get document status and analysis
+        // GET /documents/{documentId}
         const document = documents.addResource('{documentId}');
-        document.addMethod('GET', new apigateway.LambdaIntegration(submissionHandler));
+        document.addMethod('GET', new apigateway.LambdaIntegration(submissionHandler, {
+            proxy: true
+        }));
 
         // Output the API URL
         new cdk.CfnOutput(this, 'ApiUrl', {

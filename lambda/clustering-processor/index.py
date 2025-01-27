@@ -10,15 +10,6 @@ from websocket_utils import create_websocket_service
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-def extract_document_id(object_key: str) -> str:
-    """Extract document ID from the object key."""
-    try:
-        # Expected format: before-clustering/comments_DOCUMENT-ID_timestamp.csv
-        parts = object_key.split('comments_')[1].split('_')[0]
-        return parts
-    except Exception:
-        return None
-
 def send_progress_update(document_id: str) -> None:
     """Send clustering progress update via WebSocket"""
     try:
@@ -95,12 +86,40 @@ def create_job_name(document_id: str) -> str:
     
     return f"{prefix}{document_id}-{unique_id}"
 
+def extract_doc_id_from_path(s3_key: str):
+    """Extract document ID from S3 key with directory structure."""
+    # Key format: before-clustering/EPA-R10-OW-2017-0369-0001/comments_EPA-R10-OW-2017-0369-0001_...csv
+    parts = s3_key.split('/')
+    if len(parts) >= 2:
+        return parts[1]  # The document ID is the directory name
+    return None
+
+def verify_files_exist(s3_client, bucket: str, doc_id: str) -> bool:
+    """Verify that both comments and attachments files exist for the document."""
+    response = s3_client.list_objects_v2(
+        Bucket=bucket,
+        Prefix=f"before-clustering/{doc_id}/"
+    )
+    
+    if 'Contents' not in response:
+        logger.warning(f"No files found for document {doc_id}")
+        return False
+        
+    files = [obj['Key'] for obj in response.get('Contents', [])]
+    has_comments = any('comments_' in f for f in files)
+    has_attachments = any('attachments_' in f for f in files)
+    
+    logger.info(f"Files found for {doc_id} - Comments: {has_comments}, Attachments: {has_attachments}")
+    return has_comments and has_attachments
+
 def lambda_handler(event, context):
     """Start a SageMaker processing job for clustering"""
     sagemaker_client = boto3.client('sagemaker')
+    s3_client = boto3.client('s3')
     
     try:
         records = event.get('Records', [])
+            
         if not records:
             logger.error("No records found in the event.")
             return {
@@ -118,22 +137,35 @@ def lambda_handler(event, context):
                 logger.error("Bucket or key not found in the event.")
                 continue
 
-            # Extract document ID from key
-            document_id = extract_document_id(key)
-            if not document_id:
-                logger.error(f"Could not extract document ID from key: {key}")
+            # Skip if not a comments file
+            if not 'comments_' in key:
+                logger.info(f"Skipping non-comments file: {key}")
                 continue
-                
+
+            # Extract document ID from key
+            document_id = extract_doc_id_from_path(key)
+            if not document_id:
+                logger.error(f"Could not extract document ID from path: {key}")
+                continue
+
+            # Verify both files exist
+            if not verify_files_exist(s3_client, bucket, document_id):
+                logger.info(f"Still waiting for all files for document {document_id}")
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('Waiting for all files to be uploaded')
+                }
+            
             # Send initial progress update
             send_progress_update(document_id)
             update_processing_state(document_id, 'RUNNING')
 
             logger.info(f"Processing clustering for document {document_id}")
-            logger.info(f"Input file: s3://{bucket}/{key}")
+            logger.info(f"Input directory: s3://{bucket}/before-clustering/{document_id}/")
 
             # Prepare SageMaker job
             job_name = create_job_name(document_id)
-            input_s3_uri = f"s3://{bucket}/{key}"
+            input_s3_uri = f"s3://{bucket}/before-clustering/{document_id}"
             output_s3_uri = f"s3://{bucket}/after-clustering/"
 
             # Start SageMaker processing job
@@ -158,7 +190,7 @@ def lambda_handler(event, context):
                     'ContainerArguments': [
                         "--input-data", "/opt/ml/processing/input/data",
                         "--output-data", "/opt/ml/processing/output",
-                        "--object-name", os.path.basename(key),
+                        "--doc-id", document_id,
                         "--n-clusters", "10",
                     ]
                 },
@@ -166,7 +198,7 @@ def lambda_handler(event, context):
                     {
                         'InputName': 'input-data',
                         'S3Input': {
-                            'S3Uri': input_s3_uri,
+                            'S3Uri': f"s3://{bucket}/before-clustering",
                             'LocalPath': '/opt/ml/processing/input/data',
                             'S3DataType': 'S3Prefix',
                             'S3InputMode': 'File'
@@ -213,7 +245,7 @@ def lambda_handler(event, context):
 
     except Exception as e:
         logger.error(f"Error starting processing job: {str(e)}")
-        if document_id:
+        if 'document_id' in locals():
             update_processing_state(document_id, 'FAILED', str(e))
         return {
             'statusCode': 500,

@@ -28,12 +28,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 if data['type'] == 'PROGRESS_UPDATE':
                     doc_id = data['documentId']
                     progress_updates[doc_id] = {
+                        'documentTitle': data.get('documentTitle', 'unknown'),
                         'status': data['status'],
                         'stage': data.get('stage', 'unknown'),
                         'progress': data.get('progress', 0),
                         'timestamp': data['timestamp']
                     }
-                    print(f"Progress update for {doc_id}: {progress_updates[doc_id]}")
+                    print(f"Progress update for: {data}")
                     
                     # If progress is 100%, get the analysis results
                     if data.get('progress') == 100:

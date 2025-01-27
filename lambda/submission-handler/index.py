@@ -16,13 +16,15 @@ s3_client = boto3.client('s3')
 state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
 
 def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
-    """Create standardized API response with CORS headers"""
+    """Create standardized API response without CORS headers"""
     logger.debug(f"Creating response with status {status_code} and body: {body}")
     return {
         'statusCode': status_code,
         'headers': {
             'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*'
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token',
+            'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
         },
         'body': json.dumps(body)
     }
