@@ -172,7 +172,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'error': error_msg
             }
         
-        total_comments = min(document_info['totalComments'], 100)
+        total_comments = document_info['totalComments']
         
         # Get document title from the API response
         document_title = document_info['document']['attributes'].get('title', '')

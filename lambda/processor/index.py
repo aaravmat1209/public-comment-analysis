@@ -92,6 +92,20 @@ def get_secret_value(secret_arn: str) -> str:
     client = session.client('secretsmanager')
     response = client.get_secret_value(SecretId=secret_arn)
     return response['SecretString']
+ 
+def format_date_for_api(date_str: str) -> str:
+    """Format date string for regulations.gov API.
+    Converts ISO format to required format: YYYY-MM-DD HH:mm:ss"""
+    if not date_str:
+        return None
+    try:
+        # Parse the ISO format date
+        dt = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
+        # Convert to required format
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as e:
+        print(f"Error formatting date {date_str}: {str(e)}")
+        return None
 
 class RegulationsAPIClient:
     def __init__(self, api_key: str, worker_id: int):
@@ -142,20 +156,30 @@ class RegulationsAPIClient:
         self,
         object_id: str,
         page_number: int,
-        page_size: int = 100
+        page_size: int = 250,
+        last_modified_date: str = None
     ) -> List[Dict[str, Any]]:
-        """Fetch a single page of comments with details, handling rate limits"""
+        """Fetch a single page of comments with details, handling rate limits and pagination."""
         params = {
             'filter[commentOnId]': object_id,
             'page[size]': str(page_size),
             'page[number]': str(page_number),
-            'sort': 'lastModifiedDate,documentId'
+            'sort': 'lastModifiedDate,documentId'  # Important for consistent pagination
         }
+
+        # Add last modified date filter if provided
+        if last_modified_date:
+            formatted_date = format_date_for_api(last_modified_date)
+            if formatted_date:
+                params['filter[lastModifiedDate][ge]'] = formatted_date
+                print(f"Using lastModifiedDate filter: {formatted_date}")
 
         response = self._make_request('/comments', params)
         data = response.get('data', [])
         
         detailed_comments = []
+        last_processed_date = None
+        
         for comment in data:
             try:
                 # Fetch detailed comment to get the comment text
@@ -164,15 +188,21 @@ class RegulationsAPIClient:
                     {'include': 'attachments'}
                 )
                 detailed_comments.append(detailed_comment)
+                
+                # Track the last modified date for pagination
+                comment_date = comment.get('attributes', {}).get('lastModifiedDate')
+                if comment_date:
+                    if not last_processed_date or comment_date > last_processed_date:
+                        last_processed_date = comment_date
+                        
             except RateLimitReached:
-                # Stop processing more comments but return what we have so far
                 print(f"Rate limit reached after processing {len(detailed_comments)} comments")
-                raise RateLimitReached(f"Rate limit reached after processing {len(detailed_comments)} comments")
+                break  # Exit but return what we have
             except Exception as e:
-                print(f"Worker {self.worker_id} error fetching details for comment {comment['id']}: {str(e)}")
+                print(f"Error fetching details for comment {comment['id']}: {str(e)}")
                 continue
         
-        return detailed_comments
+        return detailed_comments, last_processed_date
 
 def save_comments_and_attachments(
     s3_client,
@@ -275,9 +305,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     work_range = event['workRange']['Value'] if 'Value' in event['workRange'] else event['workRange']
     worker_id = work_range['workerId']
     page_number = work_range['pageNumber']
+    last_modified_date = event.get('lastModifiedDate')  # Get last modified date if it exists
     
     try:
         print(f"Worker {worker_id} processing page {page_number}")
+        if last_modified_date:
+            print(f"Using last modified date filter: {last_modified_date}")
         
         # Initialize clients
         secret_arn = os.environ['REGULATIONS_GOV_API_KEY_SECRET_ARN']
@@ -288,16 +321,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         rate_limited = False
         comments_data = []
+        last_processed_date = None
+        
         try:
             # Fetch the page of comments with details
-            comments_data = api_client.fetch_comments_page(
+            comments_data, last_processed_date = api_client.fetch_comments_page(
                 object_id,
                 page_number,
-                work_range['pageSize']
+                work_range['pageSize'],
+                last_modified_date  # Pass the last modified date to the API
             )
         except RateLimitReached as e:
             print(f"Rate limit reached: {str(e)}")
             rate_limited = True
+            
+        if page_number != 20:
+            last_processed_date = last_modified_date
         
         # Save what we have
         if comments_data:
@@ -321,7 +360,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'attachmentsFile': attachments_key,
                 'metadata': metadata,
                 'rateLimited': rate_limited,
-                'isComplete': not rate_limited
+                'isComplete': not rate_limited,
+                'lastProcessedDate': last_processed_date  # Return the last processed date
             }
         else:
             return {
@@ -331,7 +371,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'processedComments': 0,
                 'processedAttachments': 0,
                 'rateLimited': rate_limited,
-                'isComplete': not rate_limited
+                'isComplete': not rate_limited,
+                'lastProcessedDate': last_processed_date
             }
 
     except Exception as e:

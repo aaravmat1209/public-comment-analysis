@@ -232,12 +232,79 @@ def combine_comments_and_attachments(comments_df: pd.DataFrame, attachments_df: 
             'comment_id': comment_id,
             'comment_text': comment['comment_text'],
             'combined_text': combined_text,
-            'has_attachments': comment_id in attachment_texts
+            'has_attachments': comment_id in attachment_texts,
+            'posted_date': comment.get('posted_date', '')  # Ensure posted_date is included
         })
     
     result_df = pd.DataFrame(combined_texts)
     logging.info(f"Created {len(result_df)} combined documents, {len(attachment_texts)} with attachments")
     return result_df
+
+def deduplicate_comments(df):
+    """
+    Remove comments with exactly identical text (case insensitive),
+    preserving comments that say 'See Attached' since they may have different attachments.
+    Also tracks duplicate information for reporting.
+    
+    Args:
+        df (pandas.DataFrame): DataFrame containing comments with 'comment_text' column
+        
+    Returns:
+        tuple: (deduplicated DataFrame, statistics dict, duplicate groups dict)
+    """
+    import pandas as pd
+    print(f"Starting exact text deduplication of {len(df)} comments...")
+    
+    # Convert text to lowercase for case-insensitive comparison
+    df['text_lower'] = df['comment_text'].str.lower()
+    
+    # Find comments that are just "see attached" (case insensitive)
+    see_attached_mask = df['text_lower'].str.strip().isin(['see attached', 'see attachment', 'see attachments'])
+    
+    # Split into "see attached" and regular comments
+    see_attached_df = df[see_attached_mask].copy()
+    regular_df = df[~see_attached_mask].copy()
+    
+    # Count occurrences of each unique comment text
+    text_counts = regular_df['text_lower'].value_counts()
+    duplicate_texts = text_counts[text_counts > 1].index
+    
+    # For regular comments, keep only the first occurrence of each text
+    deduplicated_regular = regular_df.drop_duplicates(subset='text_lower', keep='first')
+    
+    # Combine back with "see attached" comments
+    final_df = pd.concat([deduplicated_regular, see_attached_df])
+    
+    # Create duplicate groups mapping
+    duplicate_groups = {}
+    for text in duplicate_texts:
+        # Get all comments with this text
+        duplicate_indices = regular_df[regular_df['text_lower'] == text].index.tolist()
+        duplicate_comments = regular_df.loc[duplicate_indices][['comment_id', 'comment_text', 'posted_date']].to_dict('records')
+        
+        # Use the first comment's ID as the group identifier
+        group_id = str(duplicate_comments[0]['comment_id'])
+        duplicate_groups[group_id] = {
+            'comment_text': duplicate_comments[0]['comment_text'],
+            'duplicate_count': len(duplicate_comments),
+            'duplicate_comments': duplicate_comments
+        }
+
+    # Calculate statistics
+    stats = {
+        'total_comments': len(df),
+        'duplicate_comments_removed': len(regular_df) - len(deduplicated_regular),
+        'see_attached_comments': len(see_attached_df),
+        'remaining_comments': len(final_df),
+        'duplicate_groups': len(duplicate_groups)
+    }
+    
+    print(f"Deduplication stats: {stats}")
+    
+    # Clean up temporary column
+    final_df = final_df.drop('text_lower', axis=1)
+    
+    return final_df, stats, duplicate_groups
 
 def cluster_text(texts: List[str], n_clusters: int = 10) -> Tuple[List[int], float]:
     """Cluster text content using sentence embeddings and KMeans."""
@@ -291,6 +358,70 @@ def numpy_json_converter(obj):
         return obj.tolist()
     return obj
 
+def process_content(input_file: str, output_file: str, metadata_file: str, attachments_file: str = None, n_clusters: int = 10):
+    """Process comments and attachments for clustering."""
+    logging.info("Reading input files...")
+    
+    # Read comments
+    comments_df = pd.read_csv(input_file)
+    initial_count = len(comments_df)
+    logging.info(f"Read {initial_count} comments")
+    
+    # Read attachments if available
+    attachments_df = pd.DataFrame()
+    if attachments_file and os.path.exists(attachments_file):
+        attachments_df = pd.read_csv(attachments_file)
+        logging.info(f"Read {len(attachments_df)} attachments")
+    else:
+        logging.warning("Attachments file not found or couldn't be read")
+    
+    # Initialize results dictionary
+    results = {
+        'processing_metadata': {
+            'total_comments': initial_count,
+            'comments_with_attachments': 0,
+            'total_attachments': len(attachments_df) if not attachments_df.empty else 0,
+            'processing_timestamp': datetime.now(timezone.utc).isoformat()
+        }
+    }
+    
+    # Combine comments with their attachments
+    combined_df = combine_comments_and_attachments(comments_df, attachments_df)
+    results['processing_metadata']['comments_with_attachments'] = combined_df['has_attachments'].sum()
+    
+    # Deduplicate comments before clustering
+    if len(combined_df) > 0:
+        combined_df, dedup_stats, duplicate_groups = deduplicate_comments(combined_df)
+        results['deduplication_metadata'] = dedup_stats
+        results['duplicate_groups'] = duplicate_groups
+        
+        # Cluster the deduplicated comments
+        clusters, silhouette = cluster_text(combined_df['combined_text'].tolist(), n_clusters)
+        combined_df['cluster_id'] = clusters
+        
+        results['clustering_metadata'] = {
+            'n_clusters': len(set(clusters)),
+            'silhouette_score': float(silhouette),
+            'comments_per_cluster': combined_df.groupby('cluster_id').size().to_dict()
+        }
+        
+        # Create the combined output
+        combined_output = {
+            'metadata': results,
+            'clustered_data': combined_df.to_dict(orient='records')
+        }
+        
+        # Save combined output
+        with open(output_file, 'w') as f:
+            json.dump(combined_output, f, indent=2, default=numpy_json_converter)
+            
+        logging.info(f"Saved combined clustering results and metadata to {output_file}")
+    
+        return combined_output
+    else:
+        logging.error("No data to process")
+        return None
+
 def find_input_files(input_data: str, doc_id: str) -> Tuple[Optional[str], Optional[str]]:
     """Find comments and attachments files in the document directory."""
     doc_dir = os.path.join(input_data, doc_id)
@@ -329,71 +460,6 @@ def find_input_files(input_data: str, doc_id: str) -> Tuple[Optional[str], Optio
         logging.error(f"Error finding input files: {str(e)}")
         return None, None
 
-def process_content(
-    input_file: str,
-    output_file: str,
-    metadata_file: str,
-    attachments_file: str = None,
-    n_clusters: int = 10
-):
-    """Process comments and attachments for clustering."""
-    logging.info("Reading input files...")
-    
-    # Read comments
-    comments_df = pd.read_csv(input_file)
-    initial_count = len(comments_df)
-    logging.info(f"Read {initial_count} comments")
-    
-    # Read attachments if available - should always exist but might be empty
-    attachments_df = pd.DataFrame()
-    if attachments_file and os.path.exists(attachments_file):
-        attachments_df = pd.read_csv(attachments_file)
-        logging.info(f"Read {len(attachments_df)} attachments")
-    else:
-        logging.warning("Attachments file not found or couldn't be read")
-    
-    # Initialize results dictionary
-    results = {
-        'processing_metadata': {
-            'total_comments': initial_count,
-            'comments_with_attachments': 0,
-            'total_attachments': len(attachments_df) if not attachments_df.empty else 0,
-            'processing_timestamp': datetime.now(timezone.utc).isoformat()
-        }
-    }
-    
-    # Combine comments with their attachments
-    combined_df = combine_comments_and_attachments(comments_df, attachments_df)
-    results['processing_metadata']['comments_with_attachments'] = combined_df['has_attachments'].sum()
-    
-    # Cluster combined texts
-    if len(combined_df) > 0:
-        clusters, silhouette = cluster_text(combined_df['combined_text'].tolist(), n_clusters)
-        combined_df['cluster_id'] = clusters
-        
-        results['clustering_metadata'] = {
-            'n_clusters': len(set(clusters)),
-            'silhouette_score': float(silhouette),
-            'comments_per_cluster': combined_df.groupby('cluster_id').size().to_dict()
-        }
-        
-        # Create the combined output
-        combined_output = {
-            'metadata': results,
-            'clustered_data': combined_df.to_dict(orient='records')
-        }
-        
-        # Save combined output
-        with open(output_file, 'w') as f:
-            json.dump(combined_output, f, indent=2, default=numpy_json_converter)
-            
-        logging.info(f"Saved combined clustering results and metadata to {output_file}")
-    
-        return combined_output
-    else:
-        logging.error("No data to process")
-        return None
-    
 def main(input_data, output_data, doc_id, n_clusters):
     """Process input files and save clustered results."""
     logging.info(f"Starting processing for document ID: {doc_id}")

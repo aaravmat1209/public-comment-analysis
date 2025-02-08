@@ -27,7 +27,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     super(scope, id, props);
 
     // Set default values
-    const maxConcurrentWorkers = props.maxConcurrentWorkers || 4;
+    const maxConcurrentWorkers = props.maxConcurrentWorkers || 2;
     const lambdaMemorySize = props.lambdaMemorySize || 1024;
     const maxTimeout = props.maxTimeout || cdk.Duration.minutes(15);
 
@@ -173,28 +173,18 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       retryOnServiceExceptions: true,
     });
 
-    const checkBatchProgressStep = new tasks.LambdaInvoke(this, 'CheckBatchProgress', {
-      lambdaFunction: batchChecker,
-      resultPath: '$.batchCheck',
-      retryOnServiceExceptions: true,
-    });
-
-    // Calculate wait time based on batch size
-    const calculateWaitTime = new sfn.Pass(this, 'CalculateWaitTime', {
+    // Initialize processing state
+    const initializeState = new sfn.Pass(this, 'InitializeState', {
       parameters: {
-        'waitSeconds': 1920, // 32 minutes in seconds
-        'currentBatch.$': '$.currentBatch',
-        'documentId.$': '$.documentId',
-        'objectId.$': '$.objectId',
-        'totalComments.$': '$.totalComments',
+        'currentBatch': 0,
+        'lastModifiedDate': '',
+        'documentId.$': '$.initResult.Payload.documentId',
+        'objectId.$': '$.initResult.Payload.objectId',
+        'totalComments.$': '$.initResult.Payload.totalComments',
         'workBatches.$': '$.workBatches',
-        'totalBatches.$': '$.totalBatches'
+        'totalBatches.$': '$.workBatches.Payload.totalBatches',
+        'expectedSets.$': '$.workBatches.Payload.expectedSets'
       }
-    });
-
-    // Add wait state to respect API rate limits
-    const waitForRateLimit = new sfn.Wait(this, 'WaitForRateLimit', {
-      time: sfn.WaitTime.secondsPath('$.waitSeconds')
     });
 
     // Get current batch of workers
@@ -205,19 +195,22 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
         'documentId.$': '$.documentId',
         'objectId.$': '$.objectId',
         'totalComments.$': '$.totalComments',
+        'lastModifiedDate.$': '$.lastModifiedDate',
         'totalBatches.$': '$.workBatches.Payload.totalBatches',
+        'expectedSets.$': '$.workBatches.Payload.expectedSets',
         'workBatches.$': '$.workBatches'
       }
     });
 
-    // Process a single batch of workers
+    // Process batch with concurrent workers
     const processBatchStep = new sfn.Map(this, 'ProcessBatch', {
-      maxConcurrency: 4,
+      maxConcurrency: 2,
       itemsPath: sfn.JsonPath.stringAt('$.currentBatchWorkers'),
       parameters: {
         'workRange.$': '$$.Map.Item.Value',
         'documentId.$': '$.documentId',
         'objectId.$': '$.objectId',
+        'lastModifiedDate.$': '$.lastModifiedDate',
         'totalComments.$': '$.totalComments'
       },
       resultPath: '$.batchResults'
@@ -226,25 +219,35 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       retryOnServiceExceptions: true,
     }));
 
-    // Increment batch counter with preserved state
-    const incrementBatchStep = new sfn.Pass(this, 'IncrementBatch', {
+    const checkBatchProgressStep = new tasks.LambdaInvoke(this, 'CheckBatchProgress', {
+      lambdaFunction: batchChecker,
+      resultPath: '$.batchCheck',
+      retryOnServiceExceptions: true,
+    });
+
+    // Update state with processing results
+    const updateState = new sfn.Pass(this, 'UpdateState', {
       parameters: {
+        'lastModifiedDate.$': "States.ArrayGetItem($.batchResults[*].Payload.lastProcessedDate, States.MathAdd(States.ArrayLength($.batchResults), -1))",
         'currentBatch.$': 'States.MathAdd($.currentBatch, 1)',
         'documentId.$': '$.documentId',
         'objectId.$': '$.objectId',
         'totalComments.$': '$.totalComments',
         'workBatches.$': '$.workBatches',
-        'totalBatches.$': '$.totalBatches'
       }
     });
 
-    // Check if more batches to process
-    const checkMoreBatchesStep = new sfn.Choice(this, 'MoreBatches')
+    // Wait state for rate limiting
+    const waitState = new sfn.Wait(this, 'WaitForRateLimit', {
+      time: sfn.WaitTime.duration(cdk.Duration.minutes(60))
+    });
+
+    // Check progress and determine next action
+    const checkProgressStep = new sfn.Choice(this, 'CheckProgress')
       .when(
         sfn.Condition.booleanEquals('$.batchCheck.Payload.hasMoreBatches', true),
-        calculateWaitTime
-          .next(waitForRateLimit)
-          .next(incrementBatchStep)
+        waitState
+          .next(updateState)
           .next(getBatchStep)
       )
       .otherwise(
@@ -254,27 +257,19 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
         })
       );
 
-    // Create the sequential batch processing loop
-    const batchProcessingLoop = getBatchStep
-      .next(processBatchStep)
-      .next(checkBatchProgressStep)
-      .next(checkMoreBatchesStep);
+      // Define the main processing loop
+      const processingLoop = getBatchStep
+        .next(processBatchStep)
+        .next(checkBatchProgressStep)
+        .next(checkProgressStep);
 
-    // Define the main state machine
+    // Define the complete state machine
     const definition = initializeStep
       .next(calculateWorkRangesStep)
-      .next(new sfn.Pass(this, 'InitializeBatchCounter', {
-        parameters: {
-          'currentBatch': 0,
-          'documentId.$': '$.initResult.Payload.documentId',
-          'objectId.$': '$.initResult.Payload.objectId',
-          'totalComments.$': '$.initResult.Payload.totalComments',
-          'workBatches.$': '$.workBatches',
-          'totalBatches.$': '$.workBatches.Payload.totalBatches'
-        }
-      }))
-      .next(batchProcessingLoop);
+      .next(initializeState)
+      .next(processingLoop);
 
+    // Create the state machine
     this.stateMachine = new sfn.StateMachine(this, 'CommentProcessorStateMachine', {
       definition,
       timeout: cdk.Duration.days(7),

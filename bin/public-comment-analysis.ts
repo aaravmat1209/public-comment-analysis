@@ -15,7 +15,7 @@ const env = {
 // Create the main stack for comment processing
 const publicCommentAnalysisStack = new PublicCommentAnalysisStack(app, 'PublicCommentAnalysisStack', {
   apiKeySecretName: 'regulations-gov-api-key',
-  maxConcurrentWorkers: 4,
+  maxConcurrentWorkers: 2,
   lambdaMemorySize: 1024,
   maxTimeout: cdk.Duration.minutes(15),
   env,
