@@ -4,6 +4,8 @@ import { WebSocketStack } from '../lib/websocket-stack';
 import { RestApiStack } from '../lib/rest-api-stack';
 import { TestLambdaStack } from '../lib/test-lambda-stack';
 import { ClusteringStack } from '../lib/clustering-stack';
+import { AmplifyStack } from '../lib/amplify-stack';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 
 const app = new cdk.App();
 
@@ -59,6 +61,15 @@ const restApiStack = new RestApiStack(app, 'RestApiStack', {
   env
 });
 
+// Create the Amplify stack
+const amplifyStack = new AmplifyStack(app, 'AmplifyStack', {
+  apiUrl: restApiStack.apiUrl,
+  webSocketEndpoint: webSocketStack.webSocketEndpoint,
+  owner: 'ASUCICREPO',
+  repository: 'public-comment-analysis',
+  env
+});
+
 // Create the test stack
 const testStack = new TestLambdaStack(app, 'TestLambdaStack', {
   apiEndpoint: restApiStack.apiUrl,
@@ -71,5 +82,7 @@ clusteringStack.addDependency(publicCommentAnalysisStack);
 testStack.addDependency(restApiStack);
 restApiStack.addDependency(webSocketStack);
 restApiStack.addDependency(publicCommentAnalysisStack);
+amplifyStack.addDependency(restApiStack);
+amplifyStack.addDependency(webSocketStack);
 
 app.synth();
