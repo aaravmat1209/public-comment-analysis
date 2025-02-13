@@ -1,5 +1,6 @@
 from typing import Dict, Any, List
 import math
+import os
 
 def calculate_work_batches(
     total_comments: int,
@@ -84,6 +85,12 @@ def calculate_work_batches(
         "expectedSets": total_sets,
         "commentsPerSet": comments_per_set
     }
+    
+def calculate_workers_per_batch(apiRateLimit: str) -> int:
+    print(f"API Rate Limit set to: {apiRateLimit}")
+    workers_per_batch = math.floor((int(apiRateLimit)-50) / 250)
+    print(f"Max workers per batch: {workers_per_batch}")
+    return workers_per_batch
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Calculate work ranges for all sets of comments."""
@@ -91,7 +98,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         document_id = event['documentId']
         object_id = event['objectId']
         total_comments = event['totalComments']
-        workers_per_batch = event.get('workersPerBatch', 2)
+        workers_per_batch = calculate_workers_per_batch(os.environ['API_RATE_LIMIT'])
         current_set = event.get('currentSet', 1)
         last_modified_date = event.get('lastModifiedDate')
         

@@ -5,7 +5,7 @@ import { RestApiStack } from '../lib/rest-api-stack';
 import { TestLambdaStack } from '../lib/test-lambda-stack';
 import { ClusteringStack } from '../lib/clustering-stack';
 import { AmplifyStack } from '../lib/amplify-stack';
-import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import { ECRStack } from '../lib/ecr-stack';
 
 const app = new cdk.App();
 
@@ -14,12 +14,19 @@ const env = {
   region: process.env.CDK_DEFAULT_REGION,
 }
 
+let apiRateLimit = app.node.tryGetContext('apiRateLimit');
+
+if (!apiRateLimit || apiRateLimit.length === 0) {
+  apiRateLimit = '2000'
+}
+
 // Create the main stack for comment processing
 const publicCommentAnalysisStack = new PublicCommentAnalysisStack(app, 'PublicCommentAnalysisStack', {
   apiKeySecretName: 'regulations-gov-api-key',
   maxConcurrentWorkers: 2,
   lambdaMemorySize: 1024,
   maxTimeout: cdk.Duration.minutes(15),
+  apiRateLimit: apiRateLimit,
   env,
   tags: {
     Project: 'USDA Comment Processing',
@@ -35,6 +42,9 @@ const webSocketStack = new WebSocketStack(app, 'WebSocketStack', {
   env
 });
 
+// Create the ECR Stack
+const ecrStack = new ECRStack(app, 'ECRStack', { env });
+
 // Create the clustering stack
 const clusteringStack = new ClusteringStack(app, 'ClusteringStack', {
   outputBucketName: publicCommentAnalysisStack.outputBucketName,
@@ -45,6 +55,8 @@ const clusteringStack = new ClusteringStack(app, 'ClusteringStack', {
   webSocketApi: webSocketStack.webSocketApi,
   stageName: 'dev',
   apiGatewayEndpoint: `https://${webSocketStack.webSocketApi.apiId}.execute-api.${process.env.CDK_DEFAULT_REGION}.amazonaws.com/dev`,
+  processingImage: ecrStack.processingImage,
+  ecrRepository: ecrStack.repository,
   env,
   tags: {
     Project: 'USDA Comment Processing',
@@ -78,6 +90,7 @@ const testStack = new TestLambdaStack(app, 'TestLambdaStack', {
 });
 
 // Add dependencies
+clusteringStack.addDependency(ecrStack);
 clusteringStack.addDependency(publicCommentAnalysisStack);
 testStack.addDependency(restApiStack);
 restApiStack.addDependency(webSocketStack);

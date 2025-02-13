@@ -29,7 +29,7 @@ def send_progress_update(document_id: str) -> None:
                 'documentId': document_id,
                 'stage': 'clustering',
                 'status': 'RUNNING',
-                'progress': 80,
+                'progress': 60,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             })
     except Exception as e:

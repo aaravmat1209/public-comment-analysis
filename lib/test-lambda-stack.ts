@@ -25,7 +25,7 @@ export class TestLambdaStack extends cdk.Stack {
         }
       }),
       handler: 'index.lambda_handler',
-      timeout: cdk.Duration.minutes(10),
+      timeout: cdk.Duration.minutes(15),
       memorySize: 256,
       environment: {
         API_ENDPOINT: props.apiEndpoint,

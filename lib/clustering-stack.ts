@@ -6,17 +6,22 @@ import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
+import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
+import * as path from 'path';
 import { Construct } from 'constructs';
 
 export interface ClusteringStackProps extends cdk.StackProps {
   outputBucketName: string;
   stateMachineArn: string;
-  stateTable: dynamodb.Table;  // Add state table
-  webSocketEndpoint: string;  // Add WebSocket endpoint
+  stateTable: dynamodb.Table;
+  webSocketEndpoint: string;
   apiGatewayEndpoint: string;
-  connectionsTable: dynamodb.Table;  // Add connections table
+  connectionsTable: dynamodb.Table;
   webSocketApi: apigateway.WebSocketApi;
-  stageName: string; 
+  stageName: string;
+  processingImage: ecr_assets.DockerImageAsset;
+  ecrRepository: ecr.Repository;
 }
 
 export class ClusteringStack extends cdk.Stack {
@@ -46,21 +51,29 @@ export class ClusteringStack extends cdk.Stack {
 
     this.clusteringBucketName = this.clusteringBucket.bucketName;
 
-    // Upload processing script to S3
     new s3deploy.BucketDeployment(this, 'ProcessingScriptDeployment', {
-      sources: [s3deploy.Source.asset('scripts/clustering')],
+      sources: [
+        s3deploy.Source.asset('docker/sagemaker-processing', {
+          exclude: [
+            '*',
+            '!processing_script.py'  // Only include the processing script
+          ]
+        })
+      ],
       destinationBucket: this.clusteringBucket,
-      destinationKeyPrefix: 'process',
+      destinationKeyPrefix: 'process'
     });
 
-    // Import existing SageMaker role
-    const sagemakerRole = iam.Role.fromRoleArn(
-      this,
-      'SageMakerExecutionRole',
-      'arn:aws:iam::904233123149:role/sagemaker-processing',
-      {
-        mutable: false
-      }
+    // Create SageMaker execution role
+    const sagemakerRole = new iam.Role(this, 'SageMakerExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('sagemaker.amazonaws.com'),
+      description: 'Execution role for SageMaker processing jobs',
+      roleName: `sagemaker-processing-role-${this.account}`
+    });
+
+    // Add required managed policies
+    sagemakerRole.addManagedPolicy(
+      iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSageMakerFullAccess')
     );
 
     // Grant S3 permissions to SageMaker role
@@ -68,26 +81,37 @@ export class ClusteringStack extends cdk.Stack {
     
     // Grant ListBucket permission explicitly
     sagemakerRole.addToPrincipalPolicy(new iam.PolicyStatement({
-      actions: ['s3:ListBucket'],
-      resources: [this.clusteringBucket.bucketArn],
+      actions: [
+        's3:GetObject',
+        's3:PutObject',
+        's3:ListBucket',
+        's3:DeleteObject'
+      ],
+      resources: [
+        this.clusteringBucket.bucketArn,
+        `${this.clusteringBucket.bucketArn}/*`
+      ],
     }));
 
     // Add ECR permissions to SageMaker role
     sagemakerRole.addToPrincipalPolicy(new iam.PolicyStatement({
       actions: [
-        'ecr:GetAuthorizationToken'
+        'ecr:GetAuthorizationToken',
+        'ecr:BatchCheckLayerAvailability',
+        'ecr:GetDownloadUrlForLayer',
+        'ecr:BatchGetImage'
       ],
       resources: ['*']  // GetAuthorizationToken requires * resource
     }));
-
-    // Add specific repository permissions
+    
+    // Add CloudWatch Logs permissions
     sagemakerRole.addToPrincipalPolicy(new iam.PolicyStatement({
       actions: [
-        'ecr:BatchCheckLayerAvailability',
-        'ecr:BatchGetImage',
-        'ecr:GetDownloadUrlForLayer'
+        'logs:CreateLogGroup',
+        'logs:CreateLogStream',
+        'logs:PutLogEvents'
       ],
-      resources: [`arn:aws:ecr:${this.region}:${this.account}:repository/sagemaker-processing-image`]
+      resources: ['*']
     }));
 
     const sagemakerPolicy = new iam.PolicyStatement({
@@ -155,14 +179,14 @@ export class ClusteringStack extends cdk.Stack {
       timeout: cdk.Duration.minutes(5),
       memorySize: 1024,
       environment: {
-        IMAGE_URI: '904233123149.dkr.ecr.us-west-2.amazonaws.com/sagemaker-processing-image:latest',
+        IMAGE_URI: props.processingImage.imageUri,
         ROLE_ARN: sagemakerRole.roleArn,
-        STATE_TABLE_NAME: props.stateTable.tableName,  // Add state table name
-        WEBSOCKET_API_ENDPOINT: props.webSocketEndpoint,  // Add WebSocket endpoint
+        STATE_TABLE_NAME: props.stateTable.tableName,
+        WEBSOCKET_API_ENDPOINT: props.webSocketEndpoint,
         API_GATEWAY_ENDPOINT: props.apiGatewayEndpoint,
-        CONNECTIONS_TABLE_NAME: props.connectionsTable.tableName  // Add connections table name
+        CONNECTIONS_TABLE_NAME: props.connectionsTable.tableName
       },
-      layers: [webSocketLayer],  // Add WebSocket layer
+      layers: [webSocketLayer],
     });
 
     processingLambda.addToRolePolicy(sagemakerPolicy);
@@ -210,8 +234,9 @@ export class ClusteringStack extends cdk.Stack {
           image: lambda.Runtime.PYTHON_3_9.bundlingImage,
           command: [
             'bash', '-c',
-            'pip install -r requirements.txt -t /asset-output/python'
-          ]
+            'pip install --target /asset-output/python -r requirements.txt'
+          ],
+          user: 'root'
         }
       }),
       compatibleRuntimes: [lambda.Runtime.PYTHON_3_9],

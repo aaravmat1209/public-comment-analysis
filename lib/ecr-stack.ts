@@ -5,14 +5,15 @@ import * as path from 'path';
 import { Construct } from 'constructs';
 
 export class ECRStack extends cdk.Stack {
-  public readonly imageUri: string;
+  public readonly repository: ecr.Repository;
+  public readonly processingImage: ecr_assets.DockerImageAsset;
   
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
     // Create ECR repository
-    const repository = new ecr.Repository(this, 'SageMakerProcessingRepo', {
-      repositoryName: 'sagemaker-processing-image',
+    this.repository = new ecr.Repository(this, 'SageMakerProcessingRepo', {
+      repositoryName: `sagemaker-processing-image-${this.region}`,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
       lifecycleRules: [
         {
@@ -23,19 +24,22 @@ export class ECRStack extends cdk.Stack {
     });
 
     // Build and push the Docker image
-    const dockerAsset = new ecr_assets.DockerImageAsset(this, 'ProcessingImage', {
+    this.processingImage = new ecr_assets.DockerImageAsset(this, 'ProcessingImage', {
       directory: path.join(__dirname, '../docker/sagemaker-processing'),
       platform: ecr_assets.Platform.LINUX_AMD64,
     });
 
-    // Store the image URI for reference
-    this.imageUri = dockerAsset.imageUri;
-
     // Output the image URI
     new cdk.CfnOutput(this, 'ProcessingImageUri', {
-      value: this.imageUri,
+      value: this.processingImage.imageUri,
       description: 'URI of the SageMaker processing image',
       exportName: 'ProcessingImageUri',
+    });
+
+    new cdk.CfnOutput(this, 'RepositoryName', {
+      value: this.repository.repositoryName,
+      description: 'Name of the ECR repository',
+      exportName: 'ProcessingRepositoryName',
     });
   }
 }

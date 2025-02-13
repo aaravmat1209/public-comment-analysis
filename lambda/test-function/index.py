@@ -15,7 +15,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         websocket_endpoint = os.environ['WEBSOCKET_ENDPOINT']
         
         # Test document IDs
-        document_ids = ['EPA-R10-OW-2017-0369-0001']
+        document_ids = ['FSIS-2024-0010-0001']
         
         # Dictionary to store progress updates
         progress_updates = {}

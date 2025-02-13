@@ -41,7 +41,7 @@ def map_state_to_progress(status: str, stage: str = 'comment_processing') -> int
             'ABORTED': 80
         },
         'analysis': {
-            'RUNNING': 80,
+            'RUNNING': 90,
             'SUCCEEDED': 100,
             'FAILED': 100,
             'TIMED_OUT': 100,

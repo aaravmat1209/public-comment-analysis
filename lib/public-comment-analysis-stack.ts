@@ -15,6 +15,7 @@ export interface PublicCommentAnalysisStackProps extends cdk.StackProps {
   maxConcurrentWorkers?: number;
   lambdaMemorySize?: number;
   maxTimeout?: cdk.Duration;
+  apiRateLimit: string;
   clusteringBucketName?: string;  // Optional during first deployment
 }
 
@@ -27,7 +28,6 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     super(scope, id, props);
 
     // Set default values
-    const maxConcurrentWorkers = props.maxConcurrentWorkers || 2;
     const lambdaMemorySize = props.lambdaMemorySize || 1024;
     const maxTimeout = props.maxTimeout || cdk.Duration.minutes(15);
 
@@ -113,6 +113,7 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
         REGULATIONS_GOV_API_KEY_SECRET_ARN: apiKeySecret.secretArn,
         OUTPUT_S3_BUCKET: commentsBucket.bucketName,
         STATE_TABLE_NAME: this.stateTable.tableName,
+        API_RATE_LIMIT: props.apiRateLimit,
         CLUSTERING_BUCKET: props.clusteringBucketName || '',
       },
       logGroup: logGroup,
