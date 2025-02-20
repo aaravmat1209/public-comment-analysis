@@ -1,4 +1,4 @@
-*.js
+# *.js
 !jest.config.js
 *.d.ts
 node_modules
@@ -11,11 +11,11 @@ cdk.out
 # Logs
 frontend/logs
 frontend/*.log
-# frontend/npm-debug.log*
-# frontend/yarn-debug.log*
-# frontend/yarn-error.log*
-# frontend/pnpm-debug.log*
-# frontend/lerna-debug.log*
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+frontend/lerna-debug.log*
 
 frontend/node_modules
 frontend/dist
@@ -32,4 +32,4 @@ frontend/*.local
 # frontend/*.njsproj
 # frontend/*.sln
 # frontend/*.sw?
-# frontend/.env
+frontend/.env
