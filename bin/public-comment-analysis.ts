@@ -77,7 +77,7 @@ const restApiStack = new RestApiStack(app, 'RestApiStack', {
 const amplifyStack = new AmplifyStack(app, 'AmplifyStack', {
   apiUrl: restApiStack.apiUrl,
   webSocketEndpoint: webSocketStack.webSocketEndpoint,
-  owner: 'ASUCICREPO',
+  owner: 'aaravmat1209',
   repository: 'public-comment-analysis',
   env
 });
