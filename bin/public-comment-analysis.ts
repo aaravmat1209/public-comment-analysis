@@ -23,7 +23,8 @@ if (!apiRateLimit || apiRateLimit.length === 0) {
 // Create the main stack for comment processing
 const publicCommentAnalysisStack = new PublicCommentAnalysisStack(app, 'PublicCommentAnalysisStack', {
   apiKeySecretName: 'regulations-gov-api-key',
-  maxConcurrentWorkers: 2,
+  // maxConcurrentWorkers: 2,
+  maxConcurrentWorkers: 6, // Increased for better performance
   lambdaMemorySize: 1024,
   maxTimeout: cdk.Duration.minutes(15),
   apiRateLimit: apiRateLimit,

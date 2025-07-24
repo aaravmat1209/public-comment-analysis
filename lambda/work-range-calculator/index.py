@@ -1,13 +1,83 @@
 from typing import Dict, Any, List
 import math
 import os
+import boto3
+import json
+from datetime import datetime, timezone
+
+def get_checkpoint(document_id, worker_id, page_number):
+    """Get the last checkpoint for a specific work range."""
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
+    
+    checkpoint_id = f"checkpoint_{worker_id}_{page_number}"
+    
+    try:
+        response = table.get_item(
+            Key={
+                'documentId': document_id,
+                'chunkId': checkpoint_id
+            }
+        )
+        
+        if 'Item' in response:
+            return json.loads(response['Item']['checkpoint'])
+        return None
+    except Exception as e:
+        print(f"Error retrieving checkpoint: {str(e)}")
+        return None
 
 def calculate_work_batches(
+    document_id: str,
     total_comments: int,
     workers_per_batch: int = 2,
-    max_page_size: int = 250
+    max_page_size: int = 250,
+    reprocess_items: List[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Calculate work ranges organized into batches for all sets."""
+    # If we have items to reprocess, create a special batch for them
+    if reprocess_items and len(reprocess_items) > 0:
+        print(f"Creating reprocessing batch for {len(reprocess_items)} items")
+        
+        # Create a batch with the incomplete items
+        reprocess_workers = []
+        for item in reprocess_items:
+            worker_id = item.get('workerId')
+            page_number = item.get('pageNumber')
+            
+            # Get the original work range for this item
+            worker_range = {
+                "batchId": 0,  # Special batch for reprocessing
+                "workerId": worker_id,
+                "pageNumber": page_number,
+                "pageSize": max_page_size,
+                "expectedComments": max_page_size,  # We don't know exactly how many
+                "setNumber": 1,  # Always set 1 for reprocessing
+                "isReprocessing": True
+            }
+            reprocess_workers.append(worker_range)
+        
+        # Create a single batch for all reprocessing items
+        batches = [{
+            "batchId": 0,
+            "workers": reprocess_workers,
+            "expectedWorkers": len(reprocess_workers),
+            "setNumber": 1,
+            "isReprocessing": True
+        }]
+        
+        return {
+            "batches": batches,
+            "totalBatches": 1,  # Just one batch for reprocessing
+            "totalWorkers": len(reprocess_workers),
+            "workersPerBatch": len(reprocess_workers),
+            "totalComments": total_comments,
+            "pageSize": max_page_size,
+            "expectedSets": 1,
+            "commentsPerSet": total_comments,
+            "isReprocessing": True
+        }
+    
     # Calculate parameters within API limits
     max_pages_per_set = 20
     comments_per_set = max_pages_per_set * max_page_size  # 5000 comments per set
@@ -49,6 +119,15 @@ def calculate_work_batches(
                 )
                 
                 if expected_comments > 0:
+                    # Check if this page has a checkpoint
+                    checkpoint = get_checkpoint(document_id, current_worker_id, page_number)
+                    
+                    # Skip pages that are already fully processed
+                    if checkpoint and checkpoint.get('completed', False):
+                        print(f"Skipping worker {current_worker_id}, page {page_number} - already completed")
+                        current_worker_id += 1
+                        continue
+                    
                     worker_range = {
                         "batchId": global_batch_id,  # Use global batch ID for workers
                         "workerId": current_worker_id,
@@ -57,6 +136,12 @@ def calculate_work_batches(
                         "expectedComments": expected_comments,
                         "setNumber": current_set
                     }
+                    
+                    # Add checkpoint information if available
+                    if checkpoint:
+                        worker_range["hasCheckpoint"] = True
+                        worker_range["commentOffset"] = checkpoint.get('comment_offset', 0)
+                    
                     batch_workers.append(worker_range)
                     current_worker_id += 1
             
@@ -88,7 +173,8 @@ def calculate_work_batches(
     
 def calculate_workers_per_batch(apiRateLimit: str) -> int:
     print(f"API Rate Limit set to: {apiRateLimit}")
-    workers_per_batch = math.floor((int(apiRateLimit)-50) / 250)
+    # Reduce workers per batch to avoid timeouts
+    workers_per_batch = min(4, math.floor((int(apiRateLimit)-50) / 250))
     print(f"Max workers per batch: {workers_per_batch}")
     return workers_per_batch
 
@@ -102,15 +188,23 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         current_set = event.get('currentSet', 1)
         last_modified_date = event.get('lastModifiedDate')
         
+        # Check if we need to reprocess any items
+        reprocess_items = None
+        if 'batchCheck' in event and event['batchCheck'].get('Payload', {}).get('needsReprocessing'):
+            reprocess_items = event['batchCheck']['Payload'].get('incompleteItems', [])
+            print(f"Need to reprocess {len(reprocess_items)} items")
+        
         print(f"Calculating work ranges for document {document_id}")
         print(f"Total comments: {total_comments}, Workers per batch: {workers_per_batch}")
         print(f"Current set: {current_set}, Last modified date: {last_modified_date}")
         
         # Calculate work ranges for all sets
         work_batches = calculate_work_batches(
+            document_id,
             total_comments,
             workers_per_batch=workers_per_batch,
-            max_page_size=250
+            max_page_size=100,  # Reduce page size to avoid timeouts
+            reprocess_items=reprocess_items
         )
         
         return {

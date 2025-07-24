@@ -306,6 +306,71 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             ContentType='application/json'
         )
         
+        # Update document status to COMPLETED with 100% progress
+        try:
+            # Update the document status in DynamoDB
+            dynamodb = boto3.resource('dynamodb')
+            state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
+            
+            # Get current state to preserve existing values
+            response = state_table.get_item(
+                Key={
+                    'documentId': document_id,
+                    'chunkId': 'metadata'
+                }
+            )
+            
+            current_state = {}
+            if 'Item' in response:
+                current_state = json.loads(response['Item']['state'])
+            
+            # Create new state with SUCCEEDED status and 100% progress
+            new_state = {
+                **current_state,
+                'status': 'SUCCEEDED',  # This is the key change - update status from QUEUED to SUCCEEDED
+                'progress': 100,        # Update progress to 100%
+                'stage': 'completed',   # Set stage to completed
+                'lastUpdated': datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Update state in DynamoDB
+            state_table.update_item(
+                Key={
+                    'documentId': document_id,
+                    'chunkId': 'metadata'
+                },
+                UpdateExpression='SET #state = :state',
+                ExpressionAttributeNames={
+                    '#state': 'state'
+                },
+                ExpressionAttributeValues={
+                    ':state': json.dumps(new_state)
+                }
+            )
+            
+            print(f"Updated document status to SUCCEEDED with 100% progress")
+            
+            # Invoke the progress tracker Lambda to send WebSocket notification
+            lambda_client = boto3.client('lambda')
+            try:
+                lambda_client.invoke(
+                    FunctionName='PublicCommentAnalysis-ProgressTrackerHandler',
+                    InvocationType='Event',  # Asynchronous invocation
+                    Payload=json.dumps({
+                        'documentId': document_id,
+                        'status': 'SUCCEEDED',
+                        'stage': 'completed',
+                        'progress': 100
+                    }).encode('utf-8')
+                )
+                print(f"Invoked progress tracker Lambda to send WebSocket notification")
+            except Exception as e:
+                print(f"Error invoking progress tracker Lambda: {str(e)}")
+                # Continue processing even if Lambda invocation fails
+        except Exception as e:
+            print(f"Error updating document status: {str(e)}")
+            # Continue processing even if status update fails
+        
         # Optionally cleanup individual files
         if event.get('cleanupFiles', True):
             for file_info in comments_files + attachments_files:
@@ -316,6 +381,75 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             
             # Clean up metadata files
             clean_directory(s3_client, bucket, f"{document_id}/metadata/")
+        
+        # Update document status to COMPLETED with 100% progress
+        try:
+            # Update the document status in DynamoDB
+            dynamodb = boto3.resource('dynamodb')
+            state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
+            
+            # Get current state to preserve existing values
+            response = state_table.get_item(
+                Key={
+                    'documentId': document_id,
+                    'chunkId': 'metadata'
+                }
+            )
+            
+            current_state = {}
+            if 'Item' in response:
+                current_state = json.loads(response['Item']['state'])
+            
+            # Create new state with SUCCEEDED status and 100% progress
+            new_state = {
+                **current_state,
+                'status': 'SUCCEEDED',
+                'progress': 100,
+                'stage': 'completed',
+                'lastUpdated': datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Update state in DynamoDB
+            state_table.update_item(
+                Key={
+                    'documentId': document_id,
+                    'chunkId': 'metadata'
+                },
+                UpdateExpression='SET #state = :state',
+                ExpressionAttributeNames={
+                    '#state': 'state'
+                },
+                ExpressionAttributeValues={
+                    ':state': json.dumps(new_state)
+                }
+            )
+            
+            print(f"Updated document status to SUCCEEDED with 100% progress")
+            
+            # Instead of using WebSocket directly, invoke the progress tracker Lambda
+            # which will handle the WebSocket notification
+            lambda_client = boto3.client('lambda')
+            
+            try:
+                # Invoke the progress tracker Lambda
+                lambda_client.invoke(
+                    FunctionName='PublicCommentAnalysis-ProgressTrackerHandler',
+                    InvocationType='Event',  # Asynchronous invocation
+                    Payload=json.dumps({
+                        'documentId': document_id,
+                        'status': 'SUCCEEDED',
+                        'stage': 'completed',
+                        'progress': 100
+                    })
+                )
+                print(f"Invoked progress tracker Lambda to send WebSocket notification")
+            except Exception as e:
+                print(f"Error invoking progress tracker Lambda: {str(e)}")
+                # Continue processing even if Lambda invocation fails
+                
+        except Exception as e:
+            print(f"Error updating document status: {str(e)}")
+            # Continue processing even if status update fails
         
         return {
             'documentId': document_id,

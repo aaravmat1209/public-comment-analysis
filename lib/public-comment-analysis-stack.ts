@@ -28,7 +28,8 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     super(scope, id, props);
 
     // Set default values
-    const lambdaMemorySize = props.lambdaMemorySize || 1024;
+    // const lambdaMemorySize = props.lambdaMemorySize || 1024;
+    const lambdaMemorySize = 3008; // Increased memory for better performance
     const maxTimeout = props.maxTimeout || cdk.Duration.minutes(15);
 
     // Create S3 bucket for storing processed comments
@@ -85,6 +86,15 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
     apiKeySecret.grantRead(baseLambdaRole);
     commentsBucket.grantReadWrite(baseLambdaRole);
     this.stateTable.grantReadWriteData(baseLambdaRole);
+    
+    // Allow the Lambda role to invoke other Lambda functions (for progress tracker)
+    baseLambdaRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['lambda:InvokeFunction'],
+      resources: [
+        `arn:aws:lambda:${this.region}:${this.account}:function:PublicCommentAnalysis-ProgressTrackerHandler`,
+        `arn:aws:lambda:${this.region}:${this.account}:function:WebSocketStack-ProgressTrackerHandler*`
+      ],
+    }));
     
     // Add clustering bucket permissions if provided
     if (props.clusteringBucketName) {
@@ -157,6 +167,9 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
       environment: {
         ...lambdaConfig.environment,
         CLUSTERING_BUCKET: props.clusteringBucketName || '',
+        CONNECTIONS_TABLE_NAME: 'WebSocketStack-ConnectionsTable',
+        WEBSOCKET_API_ENDPOINT: '',  // Will be populated by WebSocketStack
+        API_GATEWAY_ENDPOINT: '',     // Will be populated by WebSocketStack
       }
     });
 
@@ -205,7 +218,8 @@ export class PublicCommentAnalysisStack extends cdk.Stack {
 
     // Process batch with concurrent workers
     const processBatchStep = new sfn.Map(this, 'ProcessBatch', {
-      maxConcurrency: 2,
+      // maxConcurrency: 2,
+      maxConcurrency:  6,
       itemsPath: sfn.JsonPath.stringAt('$.currentBatchWorkers'),
       parameters: {
         'workRange.$': '$$.Map.Item.Value',

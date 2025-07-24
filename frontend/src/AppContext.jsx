@@ -1,4 +1,4 @@
-import React, { createContext, useState } from "react";
+import React, { createContext, useState, useEffect } from "react";
 
 export const AppContext = createContext();
 
@@ -6,6 +6,51 @@ export const AppProvider = ({ children }) => {
   const [queuedDocIds, setQueuedDocIds] = useState([]);
   const [processingDocs, setProcessingDocs] = useState([]);
   const [completedDocs, setCompletedDocs] = useState([]);
+  
+  // Add polling for document status
+  useEffect(() => {
+    // Skip if no processing docs
+    if (processingDocs.length === 0) return;
+    
+    const restApiUrl = import.meta.env.VITE_RESTAPI_URL;
+    
+    // Function to check document status
+    const checkDocumentStatus = async () => {
+      for (const doc of processingDocs) {
+        try {
+          const response = await fetch(`${restApiUrl}/documents/${doc.id}`);
+          if (!response.ok) continue;
+          
+          const data = await response.json();
+          
+          // If document is completed (status SUCCEEDED and progress 100%), move it to completed
+          if (data.status === 'SUCCEEDED' && data.progress === 100) {
+            console.log(`Document ${doc.id} is completed, moving to completed docs`);
+            moveToCompleted({
+              ...doc,
+              status: 'SUCCEEDED',
+              completionPerc: 100
+            });
+          } 
+          // Otherwise update the progress
+          else if (data.progress !== doc.completionPerc) {
+            updateProcessing({
+              ...doc,
+              completionPerc: data.progress
+            });
+          }
+        } catch (error) {
+          console.error(`Error checking status for document ${doc.id}:`, error);
+        }
+      }
+    };
+    
+    // Check immediately and then every 5 seconds
+    checkDocumentStatus();
+    const interval = setInterval(checkDocumentStatus, 5000);
+    
+    return () => clearInterval(interval);
+  }, [processingDocs]);
   const addToQueue = (docId) => {
     if (!queuedDocIds.includes(docId)) {
       setQueuedDocIds((prev) => [...prev, docId]);

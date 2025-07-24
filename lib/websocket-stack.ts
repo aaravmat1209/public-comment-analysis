@@ -148,6 +148,23 @@ export class WebSocketStack extends cdk.Stack {
 
     stateMachineRule.addTarget(new targets.LambdaFunction(this.progressTracker));
 
+    // Update the combiner Lambda environment variables
+    const combinerFunction = lambda.Function.fromFunctionName(
+      this,
+      'ImportedCombinerFunction',
+      'PublicCommentAnalysis-CombinerFunction'
+    );
+    
+    if (combinerFunction instanceof lambda.Function) {
+      combinerFunction.addEnvironment('WEBSOCKET_API_ENDPOINT', this.webSocketEndpoint);
+      combinerFunction.addEnvironment('API_GATEWAY_ENDPOINT', `https://${this.webSocketApi.apiId}.execute-api.${this.region}.amazonaws.com/${this.stage.stageName}`);
+      combinerFunction.addEnvironment('CONNECTIONS_TABLE_NAME', this.connectionsTable.tableName);
+      
+      // Add WebSocket permissions to Combiner
+      combinerFunction.addToRolePolicy(webSocketManagementPolicy);
+      this.connectionsTable.grantReadWriteData(combinerFunction);
+    }
+    
     // Export outputs
     new cdk.CfnOutput(this, 'WebSocketEndpoint', {
       value: this.webSocketEndpoint,

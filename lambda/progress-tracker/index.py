@@ -28,14 +28,14 @@ def map_state_to_progress(status: str, stage: str = 'comment_processing') -> int
     PROGRESS_MAPS = {
         'comment_processing': {
             'RUNNING': 50,
-            'SUCCEEDED': 60,
+            'SUCCEEDED': 100,  # Changed from 60 to 100 to mark as completed
             'FAILED': 60,
             'TIMED_OUT': 60,
             'ABORTED': 60
         },
         'clustering': {
             'RUNNING': 60,
-            'SUCCEEDED': 80,
+            'SUCCEEDED': 100,  # Changed from 80 to 100
             'FAILED': 80,
             'TIMED_OUT': 80,
             'ABORTED': 80

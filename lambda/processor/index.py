@@ -10,6 +10,7 @@ from io import StringIO
 from typing import Dict, List, Any, Tuple, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from checkpoint_utils import get_checkpoint, save_checkpoint
 
 class RateLimitReached(Exception):
     """Custom exception for rate limit detection"""
@@ -157,8 +158,9 @@ class RegulationsAPIClient:
         object_id: str,
         page_number: int,
         page_size: int = 250,
-        last_modified_date: str = None
-    ) -> List[Dict[str, Any]]:
+        last_modified_date: str = None,
+        comment_offset: int = 0
+    ) -> Tuple[List[Dict[str, Any]], str]:
         """Fetch a single page of comments with details, handling rate limits and pagination."""
         params = {
             'filter[commentOnId]': object_id,
@@ -177,8 +179,16 @@ class RegulationsAPIClient:
         response = self._make_request('/comments', params)
         data = response.get('data', [])
         
+        # Skip already processed comments if offset is provided
+        if comment_offset > 0:
+            print(f"Skipping {comment_offset} already processed comments")
+            if comment_offset >= len(data):
+                print(f"All comments in this page were already processed")
+                return [], last_modified_date
+            data = data[comment_offset:]
+        
         detailed_comments = []
-        last_processed_date = None
+        last_processed_date = last_modified_date
         
         for comment in data:
             try:
@@ -212,7 +222,7 @@ def save_comments_and_attachments(
     page: int,
     comments_data: List[Dict[str, Any]],
     rate_limited: bool = False
-) -> Tuple[str, Dict[str, Any]]:
+) -> Tuple[str, str, Dict[str, Any]]:
     """Save a page of comments to S3 with metadata."""
     if not comments_data:
         return None, None, None
@@ -299,18 +309,42 @@ def save_comments_and_attachments(
     return comments_key, attachments_key, metadata
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Process a single page of comments with rate limit handling."""
+    """Process a single page of comments with checkpointing and timeout handling."""
     document_id = event['documentId']
     object_id = event['objectId']
     work_range = event['workRange']['Value'] if 'Value' in event['workRange'] else event['workRange']
     worker_id = work_range['workerId']
     page_number = work_range['pageNumber']
-    last_modified_date = event.get('lastModifiedDate')  # Get last modified date if it exists
+    last_modified_date = event.get('lastModifiedDate', '')  # Get last modified date if it exists
+    
+    # Calculate remaining time for processing (leave 30 seconds buffer for cleanup)
+    end_time = context.get_remaining_time_in_millis() / 1000 - 30
+    start_time = time.time()
     
     try:
         print(f"Worker {worker_id} processing page {page_number}")
         if last_modified_date:
             print(f"Using last modified date filter: {last_modified_date}")
+        
+        # Check for existing checkpoint
+        checkpoint = get_checkpoint(document_id, worker_id, page_number)
+        comment_offset = 0
+        if checkpoint:
+            print(f"Found checkpoint for worker {worker_id}, page {page_number}: {checkpoint}")
+            comment_offset = checkpoint.get('comment_offset', 0)
+            if checkpoint.get('completed', False):
+                print(f"This page was already fully processed according to checkpoint")
+                return {
+                    'workerId': worker_id,
+                    'pageNumber': page_number,
+                    'documentId': document_id,
+                    'processedComments': checkpoint.get('processed_comments', 0),
+                    'processedAttachments': checkpoint.get('processed_attachments', 0),
+                    'commentsFile': checkpoint.get('comments_file'),
+                    'attachmentsFile': checkpoint.get('attachments_file'),
+                    'isComplete': True,
+                    'lastProcessedDate': checkpoint.get('last_processed_date', last_modified_date)
+                }
         
         # Initialize clients
         secret_arn = os.environ['REGULATIONS_GOV_API_KEY_SECRET_ARN']
@@ -321,22 +355,88 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         rate_limited = False
         comments_data = []
-        last_processed_date = None
+        last_processed_date = last_modified_date
         
         try:
+            # Check if we're running out of time
+            if time.time() - start_time > end_time:
+                print(f"Not enough time to process page, saving checkpoint")
+                save_checkpoint(document_id, worker_id, page_number, {
+                    'comment_offset': comment_offset,
+                    'last_processed_date': last_processed_date,
+                    'completed': False,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                })
+                
+                return {
+                    'statusCode': 206,  # Partial Content
+                    'workerId': worker_id,
+                    'pageNumber': page_number,
+                    'documentId': document_id,
+                    'isComplete': False,
+                    'needsReprocessing': True,
+                    'lastProcessedDate': last_processed_date
+                }
+            
             # Fetch the page of comments with details
             comments_data, last_processed_date = api_client.fetch_comments_page(
                 object_id,
                 page_number,
                 work_range['pageSize'],
-                last_modified_date  # Pass the last modified date to the API
+                last_modified_date,  # Pass the last modified date to the API
+                comment_offset  # Skip already processed comments
             )
         except RateLimitReached as e:
             print(f"Rate limit reached: {str(e)}")
             rate_limited = True
             
-        if page_number != 20:
-            last_processed_date = last_modified_date
+        # Check if we're running out of time after API calls
+        if time.time() - start_time > end_time:
+            print(f"Running out of time after API calls, saving checkpoint")
+            processed_count = len(comments_data)
+            
+            # Save what we have so far
+            if comments_data:
+                comments_key, attachments_key, metadata = save_comments_and_attachments(
+                    s3_client,
+                    os.environ['OUTPUT_S3_BUCKET'],
+                    document_id,
+                    worker_id,
+                    page_number,
+                    comments_data,
+                    rate_limited
+                )
+                
+                # Save checkpoint with partial progress
+                save_checkpoint(document_id, worker_id, page_number, {
+                    'comment_offset': comment_offset + processed_count,
+                    'last_processed_date': last_processed_date,
+                    'processed_comments': metadata['processedComments'],
+                    'processed_attachments': metadata['processedAttachments'],
+                    'comments_file': comments_key,
+                    'attachments_file': attachments_key,
+                    'completed': False,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                })
+            else:
+                # Save checkpoint even if no comments were processed
+                save_checkpoint(document_id, worker_id, page_number, {
+                    'comment_offset': comment_offset,
+                    'last_processed_date': last_processed_date,
+                    'completed': False,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                })
+            
+            return {
+                'statusCode': 206,  # Partial Content
+                'workerId': worker_id,
+                'pageNumber': page_number,
+                'documentId': document_id,
+                'processedComments': len(comments_data) if comments_data else 0,
+                'isComplete': False,
+                'needsReprocessing': True,
+                'lastProcessedDate': last_processed_date
+            }
         
         # Save what we have
         if comments_data:
@@ -350,6 +450,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 rate_limited
             )
             
+            # Save checkpoint for completed page
+            save_checkpoint(document_id, worker_id, page_number, {
+                'comment_offset': comment_offset + len(comments_data),
+                'last_processed_date': last_processed_date,
+                'processed_comments': metadata['processedComments'],
+                'processed_attachments': metadata['processedAttachments'],
+                'comments_file': comments_key,
+                'attachments_file': attachments_key,
+                'completed': not rate_limited,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+            
             return {
                 'workerId': worker_id,
                 'pageNumber': page_number,
@@ -361,9 +473,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'metadata': metadata,
                 'rateLimited': rate_limited,
                 'isComplete': not rate_limited,
-                'lastProcessedDate': last_processed_date  # Return the last processed date
+                'lastProcessedDate': last_processed_date
             }
         else:
+            # Save checkpoint for empty page
+            save_checkpoint(document_id, worker_id, page_number, {
+                'comment_offset': comment_offset,
+                'last_processed_date': last_processed_date,
+                'processed_comments': 0,
+                'processed_attachments': 0,
+                'completed': True,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+            
             return {
                 'workerId': worker_id,
                 'pageNumber': page_number,
@@ -371,10 +493,23 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'processedComments': 0,
                 'processedAttachments': 0,
                 'rateLimited': rate_limited,
-                'isComplete': not rate_limited,
+                'isComplete': True,
                 'lastProcessedDate': last_processed_date
             }
 
     except Exception as e:
         print(f"Worker {worker_id} encountered an error on page {page_number}: {str(e)}")
+        
+        # Save checkpoint with error information
+        try:
+            save_checkpoint(document_id, worker_id, page_number, {
+                'comment_offset': comment_offset if 'comment_offset' in locals() else 0,
+                'last_processed_date': last_modified_date,
+                'error': str(e),
+                'completed': False,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+        except Exception as checkpoint_error:
+            print(f"Error saving checkpoint after exception: {str(checkpoint_error)}")
+        
         raise

@@ -133,6 +133,26 @@ def handle_submission(event: Dict[str, Any]) -> Dict[str, Any]:
         logger.error("Unexpected error in submission handler", exc_info=True)
         return create_response(500, {'error': 'Internal server error'})
 
+def check_s3_for_completion(document_id: str) -> bool:
+    """Check if the document has completed files in S3."""
+    try:
+        # Check for final metadata file in S3
+        output_bucket = os.environ['OUTPUT_S3_BUCKET']
+        response = s3_client.list_objects_v2(
+            Bucket=output_bucket,
+            Prefix=f"{document_id}/final/"
+        )
+        
+        # If there are files in the final directory, the document is completed
+        if 'Contents' in response and len(response['Contents']) > 0:
+            logger.info(f"Found completed files for document {document_id} in S3")
+            return True
+        
+        return False
+    except Exception as e:
+        logger.warning(f"Error checking S3 for completion: {str(e)}")
+        return False
+
 def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
     """Handle document status check with enhanced error handling"""
     document_id = event['pathParameters']['documentId']
@@ -153,6 +173,31 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
         
         state = json.loads(response['Item']['state'])
         logger.info(f"Retrieved status for document {document_id}: {state['status']}")
+        
+        # Check if document is completed in S3 but status is not updated
+        if state['status'] != 'SUCCEEDED' and state.get('progress', 0) < 100:
+            is_completed = check_s3_for_completion(document_id)
+            if is_completed:
+                logger.info(f"Document {document_id} is completed in S3 but status is not updated, fixing status")
+                state['status'] = 'SUCCEEDED'
+                state['progress'] = 100
+                state['stage'] = 'completed'
+                state['lastUpdated'] = datetime.now(timezone.utc).isoformat()
+                
+                # Update the state in DynamoDB
+                state_table.update_item(
+                    Key={
+                        'documentId': document_id,
+                        'chunkId': 'metadata'
+                    },
+                    UpdateExpression='SET #state = :state',
+                    ExpressionAttributeNames={
+                        '#state': 'state'
+                    },
+                    ExpressionAttributeValues={
+                        ':state': json.dumps(state)
+                    }
+                )
         
         response_body = {
             'documentId': document_id,
