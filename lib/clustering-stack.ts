@@ -77,15 +77,16 @@ export class ClusteringStack extends cdk.Stack {
     );
 
     // Grant S3 permissions to SageMaker role
-    this.clusteringBucket.grantRead(sagemakerRole);
+    this.clusteringBucket.grantReadWrite(sagemakerRole);
     
-    // Grant ListBucket permission explicitly
+    // Grant comprehensive S3 permissions explicitly
     sagemakerRole.addToPrincipalPolicy(new iam.PolicyStatement({
       actions: [
         's3:GetObject',
         's3:PutObject',
         's3:ListBucket',
-        's3:DeleteObject'
+        's3:DeleteObject',
+        's3:GetObjectVersion'
       ],
       resources: [
         this.clusteringBucket.bucketArn,
