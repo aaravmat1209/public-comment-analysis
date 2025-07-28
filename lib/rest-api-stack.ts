@@ -11,6 +11,7 @@ interface RestApiStackProps extends cdk.StackProps {
     stateTable: dynamodb.Table;
     webSocketEndpoint: string;
     clusteringBucketName: string;
+    outputBucketName?: string;
 }
 
 export class RestApiStack extends cdk.Stack {
@@ -103,6 +104,7 @@ export class RestApiStack extends cdk.Stack {
                 STATE_TABLE_NAME: props.stateTable.tableName,
                 WEBSOCKET_API_ENDPOINT: props.webSocketEndpoint,
                 CLUSTERING_BUCKET: props.clusteringBucketName,
+                OUTPUT_S3_BUCKET: props.outputBucketName || '',
             },
             timeout: cdk.Duration.minutes(1),
         });
@@ -110,6 +112,17 @@ export class RestApiStack extends cdk.Stack {
         // Grant permissions
         props.stateMachine.grantStartExecution(submissionHandler);
         props.stateTable.grantReadWriteData(submissionHandler);
+
+        // Add SageMaker permissions for checking job status
+        submissionHandler.addToRolePolicy(new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+                'sagemaker:ListProcessingJobs',
+                'sagemaker:DescribeProcessingJob',
+                'sagemaker:StopProcessingJob'
+            ],
+            resources: ['*']
+        }));
 
         if (props.clusteringBucketName) {
             const clusteringBucketPolicy = new iam.PolicyStatement({
@@ -121,6 +134,18 @@ export class RestApiStack extends cdk.Stack {
                 ]
             });
             submissionHandler.addToRolePolicy(clusteringBucketPolicy);
+        }
+
+        if (props.outputBucketName) {
+            const outputBucketPolicy = new iam.PolicyStatement({
+                effect: iam.Effect.ALLOW,
+                actions: ['s3:GetObject', 's3:ListBucket'],
+                resources: [
+                    `arn:aws:s3:::${props.outputBucketName}`,
+                    `arn:aws:s3:::${props.outputBucketName}/*`
+                ]
+            });
+            submissionHandler.addToRolePolicy(outputBucketPolicy);
         }
 
         // Create API endpoints

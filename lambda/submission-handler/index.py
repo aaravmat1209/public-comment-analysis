@@ -13,6 +13,7 @@ logger.setLevel(logging.INFO)
 stepfunctions = boto3.client('stepfunctions')
 dynamodb = boto3.resource('dynamodb')
 s3_client = boto3.client('s3')
+sagemaker_client = boto3.client('sagemaker')
 state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
 
 def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -153,6 +154,71 @@ def check_s3_for_completion(document_id: str) -> bool:
         logger.warning(f"Error checking S3 for completion: {str(e)}")
         return False
 
+def check_clustering_completion(document_id: str, cluster_bucket: str) -> bool:
+    """Check if clustering analysis is complete by looking for analysis JSON file."""
+    try:
+        # Check for analysis JSON file
+        response = s3_client.list_objects_v2(
+            Bucket=cluster_bucket,
+            Prefix=f"analysis-json/comments_{document_id}"
+        )
+        
+        if 'Contents' in response and len(response['Contents']) > 0:
+            logger.info(f"Found analysis JSON for document {document_id}")
+            return True
+        
+        return False
+    except Exception as e:
+        logger.warning(f"Error checking clustering completion: {str(e)}")
+        return False
+
+def check_and_fix_stuck_sagemaker_jobs(document_id: str) -> bool:
+    """Check for stuck SageMaker jobs and determine if clustering is actually complete."""
+    try:
+        # List SageMaker processing jobs for this document
+        response = sagemaker_client.list_processing_jobs(
+            NameContains=document_id,
+            MaxResults=10,
+            SortBy='CreationTime',
+            SortOrder='Descending'
+        )
+        
+        for job in response.get('ProcessingJobSummaries', []):
+            job_name = job['ProcessingJobName']
+            job_status = job['ProcessingJobStatus']
+            
+            logger.info(f"Found SageMaker job {job_name} with status {job_status}")
+            
+            # If job is stuck in InProgress, check if outputs exist
+            if job_status == 'InProgress':
+                cluster_bucket = os.environ.get('CLUSTERING_BUCKET')
+                if cluster_bucket:
+                    # Check if clustered results file exists
+                    clustered_results_response = s3_client.list_objects_v2(
+                        Bucket=cluster_bucket,
+                        Prefix=f"after-clustering/clustered_results_{document_id}"
+                    )
+                    
+                    if 'Contents' in clustered_results_response:
+                        logger.info(f"Found clustered results for {document_id}, job likely completed but status not updated")
+                        
+                        # Try to stop the job to force status update
+                        try:
+                            sagemaker_client.stop_processing_job(ProcessingJobName=job_name)
+                            logger.info(f"Stopped stuck SageMaker job {job_name}")
+                        except Exception as stop_error:
+                            logger.warning(f"Could not stop job {job_name}: {str(stop_error)}")
+                        
+                        return True
+            
+            elif job_status == 'Completed':
+                return True
+                
+        return False
+    except Exception as e:
+        logger.warning(f"Error checking SageMaker jobs: {str(e)}")
+        return False
+
 def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
     """Handle document status check with enhanced error handling"""
     document_id = event['pathParameters']['documentId']
@@ -177,8 +243,22 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
         # Check if document is completed in S3 but status is not updated
         if state['status'] != 'SUCCEEDED' and state.get('progress', 0) < 100:
             is_completed = check_s3_for_completion(document_id)
+            
+            # Also check clustering completion if we have clustering bucket
+            cluster_bucket = os.environ.get('CLUSTERING_BUCKET')
+            clustering_completed = False
+            if cluster_bucket:
+                clustering_completed = check_clustering_completion(document_id, cluster_bucket)
+                
+                # If clustering appears complete but status is stuck, check SageMaker jobs
+                if clustering_completed and not is_completed:
+                    sagemaker_completed = check_and_fix_stuck_sagemaker_jobs(document_id)
+                    if sagemaker_completed:
+                        logger.info(f"Document {document_id} clustering is complete, updating status")
+                        is_completed = True
+            
             if is_completed:
-                logger.info(f"Document {document_id} is completed in S3 but status is not updated, fixing status")
+                logger.info(f"Document {document_id} is completed but status is not updated, fixing status")
                 state['status'] = 'SUCCEEDED'
                 state['progress'] = 100
                 state['stage'] = 'completed'
@@ -209,22 +289,55 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
             'lastUpdated': state.get('lastUpdated')
         }
         
-        # Include full state for debugging
+        # Include updated state for debugging
         response_body['state'] = state
         
-        # Get clustering analysis if document is completed successfully
+        # Get clustering analysis if document is completed successfully OR if analysis exists
         cluster_bucket = os.environ.get('CLUSTERING_BUCKET')
-        if (cluster_bucket and 
-            state['status'] in ['SUCCEEDED', 'COMPLETED'] and 
-            state.get('progress', 0) >= 100):
+        if cluster_bucket:
+            # Try to get analysis if document is completed OR if analysis file exists
+            should_get_analysis = (
+                (state['status'] in ['SUCCEEDED', 'COMPLETED'] and state.get('progress', 0) >= 100) or
+                check_clustering_completion(document_id, cluster_bucket)
+            )
             
-            analysis = get_analysis_json(document_id, cluster_bucket)
-            if analysis:
-                response_body['analysis'] = analysis
-                logger.info(f"Successfully retrieved analysis for document {document_id}")
-            else:
-                response_body['warning'] = 'Analysis results not yet available'
-                logger.warning(f"Analysis results not found for completed document {document_id}")
+            if should_get_analysis:
+                analysis = get_analysis_json(document_id, cluster_bucket)
+                if analysis:
+                    response_body['analysis'] = analysis
+                    logger.info(f"Successfully retrieved analysis for document {document_id}")
+                    
+                    # If we found analysis but status isn't complete, update it
+                    if state['status'] != 'SUCCEEDED' or state.get('progress', 0) < 100:
+                        logger.info(f"Found analysis for {document_id}, updating status to completed")
+                        state['status'] = 'SUCCEEDED'
+                        state['progress'] = 100
+                        state['stage'] = 'completed'
+                        state['lastUpdated'] = datetime.now(timezone.utc).isoformat()
+                        
+                        # Update response body
+                        response_body['status'] = state['status']
+                        response_body['progress'] = state['progress']
+                        response_body['stage'] = state['stage']
+                        response_body['lastUpdated'] = state['lastUpdated']
+                        
+                        # Update the state in DynamoDB
+                        state_table.update_item(
+                            Key={
+                                'documentId': document_id,
+                                'chunkId': 'metadata'
+                            },
+                            UpdateExpression='SET #state = :state',
+                            ExpressionAttributeNames={
+                                '#state': 'state'
+                            },
+                            ExpressionAttributeValues={
+                                ':state': json.dumps(state)
+                            }
+                        )
+                else:
+                    response_body['warning'] = 'Analysis results not yet available'
+                    logger.warning(f"Analysis results not found for document {document_id}")
         
         # Add failure details if processing failed
         if state['status'] in ['FAILED', 'TIMED_OUT', 'ABORTED']:

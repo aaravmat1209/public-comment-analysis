@@ -1,0 +1,37 @@
+{
+  "clusters": [
+    {
+      "clusterName": "Support for FDA Drug Regulation",
+      "clusterDescription": "Comments supporting FDA drug approval and regulation of Silver Diamine Fluoride (SDF) 38% for pediatric use",
+      "overallSentiment": "Positive",
+      "repOrg": [
+        "Dental Professionals",
+        "Healthcare Providers",
+        "Public Health Advocates"
+      ],
+      "recActions": [
+        "Proceed with FDA drug approval process for SDF 38%",
+        "Establish safety and efficacy standards for pediatric use",
+        "Implement quality control measures for US-made products"
+      ],
+      "relComments": [
+        "Pediatric patients should be protected by this category of products regulated as drugs by the Food and Drug Administration.",
+        "I support FDA drug approval for SDF 38% to ensure safety and efficacy for pediatric use.",
+        "SDF products should be regulated as drugs. Child safety and product efficacy matters."
+      ]
+    }
+  ],
+  "processing_metadata": {
+    "total_comments": 215,
+    "comments_with_attachments": 2,
+    "total_attachments": 2,
+    "processing_timestamp": "2025-07-28T01:20:21.000000+00:00"
+  },
+  "clustering_metadata": {
+    "n_clusters": 1,
+    "silhouette_score": 0.85,
+    "comments_per_cluster": {
+      "0": 215
+    }
+  }
+}
