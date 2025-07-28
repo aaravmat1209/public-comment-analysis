@@ -301,8 +301,17 @@ def cluster_text(texts: List[str], n_clusters: int = 10) -> Tuple[List[int], flo
         normalize_embeddings=True
     )
     
-    # Adjust number of clusters if necessary
-    n_clusters = min(n_clusters, len(texts))
+    # Adjust number of clusters based on data size
+    # For silhouette score calculation, we need at least 2 clusters and at most n_samples - 1
+    max_clusters = max(1, len(texts) - 1) if len(texts) > 1 else 1
+    n_clusters = min(n_clusters, max_clusters)
+    
+    # For very small datasets, use fewer clusters
+    if len(texts) <= 2:
+        n_clusters = 1
+    elif len(texts) <= 5:
+        n_clusters = min(n_clusters, 2)
+    
     logging.info(f"Using {n_clusters} clusters for {len(texts)} items")
     
     # Apply KMeans clustering
@@ -313,13 +322,17 @@ def cluster_text(texts: List[str], n_clusters: int = 10) -> Tuple[List[int], flo
     )
     clusters = kmeans.fit_predict(embeddings)
     
-    # Calculate silhouette score if more than one cluster
-    if len(set(clusters)) > 1:
-        silhouette = silhouette_score(embeddings, clusters)
-        logging.info(f"Calculated silhouette score: {silhouette}")
+    # Calculate silhouette score if we have more than one cluster and enough samples
+    if len(set(clusters)) > 1 and len(texts) >= 2:
+        try:
+            silhouette = silhouette_score(embeddings, clusters)
+            logging.info(f"Calculated silhouette score: {silhouette}")
+        except ValueError as e:
+            logging.warning(f"Could not calculate silhouette score: {str(e)}")
+            silhouette = 0.0
     else:
         silhouette = 0.0
-        logging.warning("Only one cluster found, silhouette score set to 0")
+        logging.warning("Only one cluster or insufficient samples, silhouette score set to 0")
     
     return clusters, silhouette
 

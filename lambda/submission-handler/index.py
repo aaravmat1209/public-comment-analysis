@@ -212,18 +212,19 @@ def handle_status_check(event: Dict[str, Any]) -> Dict[str, Any]:
         # Include full state for debugging
         response_body['state'] = state
         
-        # Get clustering analysis if final stage is complete
+        # Get clustering analysis if document is completed successfully
         cluster_bucket = os.environ.get('CLUSTERING_BUCKET')
         if (cluster_bucket and 
-            state.get('stage') == 'analysis' and 
-            state['status'] == 'SUCCEEDED' and 
+            state['status'] in ['SUCCEEDED', 'COMPLETED'] and 
             state.get('progress', 0) >= 100):
             
             analysis = get_analysis_json(document_id, cluster_bucket)
             if analysis:
                 response_body['analysis'] = analysis
+                logger.info(f"Successfully retrieved analysis for document {document_id}")
             else:
                 response_body['warning'] = 'Analysis results not yet available'
+                logger.warning(f"Analysis results not found for completed document {document_id}")
         
         # Add failure details if processing failed
         if state['status'] in ['FAILED', 'TIMED_OUT', 'ABORTED']:

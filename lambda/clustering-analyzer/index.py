@@ -38,10 +38,24 @@ def update_processing_state(document_id: str, status: str, error: str = None) ->
         dynamodb = boto3.resource('dynamodb')
         state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
         
+        # Get current state to preserve existing values
+        response = state_table.get_item(
+            Key={
+                'documentId': document_id,
+                'chunkId': 'metadata'
+            }
+        )
+        
+        current_state = {}
+        if 'Item' in response:
+            current_state = json.loads(response['Item']['state'])
+        
+        # Set final completion status
         state = {
+            **current_state,
             'status': status,
-            'stage': 'analysis',
-            'progress': 100 if status == 'SUCCEEDED' else 90,
+            'stage': 'completed' if status == 'SUCCEEDED' else 'analysis',
+            'progress': 100,
             'lastUpdated': datetime.now(timezone.utc).isoformat()
         }
         
@@ -81,9 +95,9 @@ def send_progress_update(document_id: str, status: str, error: str = None) -> No
             ws_service.broadcast_message({
                 'type': 'PROGRESS_UPDATE',
                 'documentId': document_id,
-                'stage': 'analysis',
+                'stage': 'completed' if status == 'SUCCEEDED' else 'analysis',
                 'status': status,
-                'progress': 100 if status == 'SUCCEEDED' else 90,
+                'progress': 100,
                 'error': error,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             })

@@ -41,10 +41,28 @@ def update_processing_state(document_id: str, status: str, error: str = None) ->
         dynamodb = boto3.resource('dynamodb')
         state_table = dynamodb.Table(os.environ['STATE_TABLE_NAME'])
         
+        # Get current state to preserve existing values
+        response = state_table.get_item(
+            Key={
+                'documentId': document_id,
+                'chunkId': 'metadata'
+            }
+        )
+        
+        current_state = {}
+        if 'Item' in response:
+            current_state = json.loads(response['Item']['state'])
+        
+        # Only update if we're not already completed
+        if current_state.get('stage') == 'completed':
+            logger.info(f"Document {document_id} already completed, skipping clustering status update")
+            return
+            
         state = {
+            **current_state,
             'status': status,
             'stage': 'clustering',
-            'progress': 85 if status == 'SUCCEEDED' else 80,
+            'progress': 80 if status == 'RUNNING' else 85,  # Keep at 85% for clustering completion
             'lastUpdated': datetime.now(timezone.utc).isoformat()
         }
         
